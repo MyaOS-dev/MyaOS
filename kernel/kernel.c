@@ -1,64 +1,15 @@
-extern void idt_init();
-extern void pit_init();
-extern void shell_init();
-extern void enable_cursor(); 
-extern void scheduler_init();
-extern void scheduler_start();
-extern void ramfs_init();
-extern void kb_init();
-extern void set_cursor_pos(int pos);
-#include "stdint.h"
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
-void clear_screen() {
-    char* vga = (char*)0xB8000;
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga[i * 2] = ' ';      
-        vga[i * 2 + 1] = 0x07; 
-    }
-}
-typedef struct {
-    uint64_t base;
-    uint64_t length;
-    uint32_t type;
-    uint32_t acpi;
-} __attribute__((packed)) e820_entry_t;
-uint64_t total_memory = 0;
-void parse_memory_map(uint32_t mmap_addr, uint32_t entries) {
-
-    e820_entry_t* entry = (e820_entry_t*)mmap_addr;
-
-    for (uint32_t i = 0; i < entries; i++){
-
-        if (entry[i].length == 0)
-            break;
-
-        if (entry[i].type == 1) { 
-            total_memory += entry[i].length;
+#include "boot.h"
+#include <stdint.h>
+#include <stddef.h>
+void kernel_main(boot_info_t* boot) {
+    framebuffer_t* fb = &boot->fb;
+    volatile uint32_t* pixels = (volatile uint32_t*)(uintptr_t)fb->base;
+    for (uint32_t y = 0; y < fb->height; y++) {
+        for (uint32_t x = 0; x < fb->width; x++) {
+            pixels[y * fb->pixels_per_scanline + x] = 0x00ffffff;
         }
     }
-}
-void kernel_main(uint32_t mmap_addr, uint32_t mmap_entries){
-    clear_screen();
-    enable_cursor();
-    ramfs_init();
-    parse_memory_map(mmap_addr, mmap_entries);
-    char* vga = (char*)0xB8000;
-    const char* msg = "MyaKRNL Booted!";
-    for (int i = 0; msg[i]; i++) {
-        vga[i*2] = msg[i];
-        vga[i*2+1] = 0x0F;
-    }
-    idt_init();
-    pit_init();
-    set_cursor_pos(80);
-    shell_init();
-    kb_init();
-
-    scheduler_init();
-    __asm__ volatile("sti");
-    scheduler_start();  
-    while (1) {
-        __asm__("hlt");
+    for (;;) {
+        __asm__ __volatile__("cli; hlt");
     }
 }
