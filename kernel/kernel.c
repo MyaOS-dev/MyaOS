@@ -11,7 +11,7 @@ void kernel_main(boot_info_t* boot) {
             pixels[y * fb->pixels_per_scanline + x] = 0x00ffffff;
         }
     }
-    draw_symbol(boot, 5, 10)
+    draw_symbol(boot, 5, 10);
     for (;;) {
         __asm__ __volatile__("cli; hlt");
     }
