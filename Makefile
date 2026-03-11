@@ -28,14 +28,18 @@ $(BUILD)/entry.o: kernel/entry.asm | $(BUILD)
 $(BUILD)/kernel.o: kernel/kernel.c kernel/boot.h kernel/graphics.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/kernel.c -o $(BUILD)/kernel.o
 
-$(BUILD)/graphics.o: kernel/graphics.c kernel/boot.h kernel/graphics.h | $(BUILD)
+$(BUILD)/graphics.o: kernel/graphics.c kernel/boot.h kernel/graphics.h kernel/font.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/graphics.c -o $(BUILD)/graphics.o
 
-$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o linker.ld
+$(BUILD)/font.o: kernel/font.c kernel/font.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/font.c -o $(BUILD)/font.o
+
+$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUILD)/font.o linker.ld
 	$(LD_KERNEL) $(LDFLAGS_KERNEL) \
 		$(BUILD)/entry.o \
 		$(BUILD)/kernel.o \
 		$(BUILD)/graphics.o \
+		$(BUILD)/font.o \
 		-o $(BUILD)/$(KERNEL)
 
 $(BUILD)/kernel_blob.o: $(BUILD)/$(KERNEL)

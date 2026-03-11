@@ -4,14 +4,14 @@
 #include <stddef.h>
 
 void kernel_main(boot_info_t* boot) {
-    framebuffer_t* fb = &boot->fb;
-    volatile uint32_t* pixels = (volatile uint32_t*)(uintptr_t)fb->base;
-    for (uint32_t y = 0; y < fb->height; y++) {
-        for (uint32_t x = 0; x < fb->width; x++) {
-            pixels[y * fb->pixels_per_scanline + x] = 0x00ffffff;
-        }
-    }
+    clear_screen(boot, 0x00000000);
+
+    draw_string(boot, 16, 16, "Hello from MyaOS", 0x00FFFFFF, 0x00000000);
+    draw_string(boot, 16, 32, "Kernel started", 0x00FFFFFF, 0x00000000);
+    draw_string(boot, 16, 48, "Font: 8x16", 0x00FFFFFF, 0x00000000);
+
     draw_symbol(boot, 5, 10);
+
     for (;;) {
         __asm__ __volatile__("cli; hlt");
     }
