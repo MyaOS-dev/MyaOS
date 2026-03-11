@@ -1,5 +1,5 @@
 #include "boot.h"
-#include "graphics.c"
+#include "graphics.h"
 #include <stdint.h>
 #include <stddef.h>
 
