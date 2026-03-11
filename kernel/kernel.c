@@ -3,8 +3,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-extern write_symbol(boot_info_t* boot, int xcord, int ycord);
-
 void kernel_main(boot_info_t* boot) {
     framebuffer_t* fb = &boot->fb;
     volatile uint32_t* pixels = (volatile uint32_t*)(uintptr_t)fb->base;
