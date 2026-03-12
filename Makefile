@@ -25,7 +25,7 @@ $(BUILD):
 $(BUILD)/entry.o: kernel/entry.asm | $(BUILD)
 	$(NASM) -f elf64 kernel/entry.asm -o $(BUILD)/entry.o
 
-$(BUILD)/kernel.o: kernel/kernel.c kernel/boot.h kernel/graphics.h | $(BUILD)
+$(BUILD)/kernel.o: kernel/kernel.c kernel/boot.h kernel/shell.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/kernel.c -o $(BUILD)/kernel.o
 
 $(BUILD)/graphics.o: kernel/graphics.c kernel/boot.h kernel/graphics.h kernel/font.h | $(BUILD)
@@ -34,25 +34,44 @@ $(BUILD)/graphics.o: kernel/graphics.c kernel/boot.h kernel/graphics.h kernel/fo
 $(BUILD)/font.o: kernel/font.c kernel/font.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/font.c -o $(BUILD)/font.o
 
-$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUILD)/font.o linker.ld
+$(BUILD)/keyboard.o: kernel/keyboard.c kernel/keyboard.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/keyboard.c -o $(BUILD)/keyboard.o
+
+$(BUILD)/power.o: kernel/power.c kernel/power.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/power.c -o $(BUILD)/power.o
+
+$(BUILD)/fat32.o: kernel/fat32.c kernel/fat32.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/fat32.c -o $(BUILD)/fat32.o
+
+$(BUILD)/ramfs.o: kernel/ramfs.c kernel/ramfs.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/ramfs.c -o $(BUILD)/ramfs.o
+
+$(BUILD)/blockio.o: kernel/blockio.c kernel/blockio.h kernel/boot.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/blockio.c -o $(BUILD)/blockio.o
+
+$(BUILD)/shell.o: kernel/shell.c kernel/shell.h kernel/boot.h kernel/graphics.h kernel/keyboard.h kernel/power.h kernel/fat32.h kernel/ramfs.h kernel/blockio.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/shell.c -o $(BUILD)/shell.o
+
+$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUILD)/font.o $(BUILD)/keyboard.o $(BUILD)/power.o $(BUILD)/fat32.o $(BUILD)/ramfs.o $(BUILD)/blockio.o $(BUILD)/shell.o linker.ld
 	$(LD_KERNEL) $(LDFLAGS_KERNEL) \
 		$(BUILD)/entry.o \
 		$(BUILD)/kernel.o \
 		$(BUILD)/graphics.o \
 		$(BUILD)/font.o \
+		$(BUILD)/keyboard.o \
+		$(BUILD)/power.o \
+		$(BUILD)/fat32.o \
+		$(BUILD)/ramfs.o \
+		$(BUILD)/blockio.o \
+		$(BUILD)/shell.o \
 		-o $(BUILD)/$(KERNEL)
-
-$(BUILD)/kernel_blob.o: $(BUILD)/$(KERNEL)
-	$(OBJCOPY) -I binary -O elf64-x86-64 -B i386:x86-64 \
-		$(BUILD)/$(KERNEL) $(BUILD)/kernel_blob.o
 
 $(BUILD)/boot.o: boot/boot.c kernel/boot.h | $(BUILD)
 	$(CC) $(CFLAGS_EFI) -DEFI_FUNCTION_WRAPPER -c boot/boot.c -o $(BUILD)/boot.o
 
-$(BUILD)/boot.so: $(BUILD)/boot.o $(BUILD)/kernel_blob.o
+$(BUILD)/boot.so: $(BUILD)/boot.o
 	$(LD_EFI) $(LDFLAGS_EFI) \
 		$(BUILD)/boot.o \
-		$(BUILD)/kernel_blob.o \
 		-L /usr/lib -lefi -lgnuefi \
 		-o $(BUILD)/boot.so
 
@@ -69,20 +88,20 @@ $(BUILD)/$(EFI_BOOT): $(BUILD)/boot.so
 		-O efi-app-x86_64 \
 		$(BUILD)/boot.so $(BUILD)/$(EFI_BOOT)
 
-$(BUILD)/$(ESP_IMAGE): $(BUILD)/$(EFI_BOOT)
+$(BUILD)/$(ESP_IMAGE): $(BUILD)/$(EFI_BOOT) $(BUILD)/$(KERNEL)
 	rm -f $(BUILD)/$(ESP_IMAGE)
 	dd if=/dev/zero of=$(BUILD)/$(ESP_IMAGE) bs=1M count=64
 	mkfs.fat -F 32 $(BUILD)/$(ESP_IMAGE)
 	mmd -i $(BUILD)/$(ESP_IMAGE) ::/EFI
 	mmd -i $(BUILD)/$(ESP_IMAGE) ::/EFI/BOOT
 	mcopy -i $(BUILD)/$(ESP_IMAGE) $(BUILD)/$(EFI_BOOT) ::/EFI/BOOT/BOOTX64.EFI
+	mcopy -i $(BUILD)/$(ESP_IMAGE) $(BUILD)/$(KERNEL) ::/kernel.elf
+	mcopy -i $(BUILD)/$(ESP_IMAGE) $(BUILD)/$(KERNEL) ::/EFI/BOOT/kernel.elf
 
 run: all
 	qemu-system-x86_64 \
 		-machine q35 \
-		-m 512M \
-		-no-reboot \
-		-no-shutdown \
+		-m 1G \
 		-drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.4m.fd \
 		-drive if=pflash,format=raw,file=/usr/share/edk2/x64/OVMF_VARS.4m.fd \
 		-drive file=$(BUILD)/$(ESP_IMAGE),format=raw

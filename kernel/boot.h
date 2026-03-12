@@ -14,5 +14,15 @@ typedef struct {
     uint64_t mmap;
     uint64_t mmap_size;
     uint64_t desc_size;
+    uint64_t boot_disk_base;
+    uint64_t boot_disk_size;
+    uint64_t efi_reset_system;
+    uint64_t efi_block_io;
+    uint64_t boot_disk_lba_start;
+    uint64_t boot_disk_block_count;
+    uint32_t boot_disk_media_id;
+    uint32_t boot_disk_block_size;
+    uint32_t boot_disk_read_only;
+    uint32_t boot_services_active;
 } boot_info_t;
 #endif
