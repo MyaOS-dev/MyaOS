@@ -25,7 +25,7 @@ $(BUILD):
 $(BUILD)/entry.o: kernel/entry.asm | $(BUILD)
 	$(NASM) -f elf64 kernel/entry.asm -o $(BUILD)/entry.o
 
-$(BUILD)/kernel.o: kernel/kernel.c kernel/boot.h kernel/shell.h | $(BUILD)
+$(BUILD)/kernel.o: kernel/kernel.c kernel/boot.h kernel/shell.h kernel/pmm.h kernel/heap.h kernel/paging.h kernel/interrupts.h kernel/timer.h kernel/scheduler.h kernel/syscall.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/kernel.c -o $(BUILD)/kernel.o
 
 $(BUILD)/graphics.o: kernel/graphics.c kernel/boot.h kernel/graphics.h kernel/font.h | $(BUILD)
@@ -49,10 +49,34 @@ $(BUILD)/ramfs.o: kernel/ramfs.c kernel/ramfs.h | $(BUILD)
 $(BUILD)/blockio.o: kernel/blockio.c kernel/blockio.h kernel/boot.h | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/blockio.c -o $(BUILD)/blockio.o
 
-$(BUILD)/shell.o: kernel/shell.c kernel/shell.h kernel/boot.h kernel/graphics.h kernel/keyboard.h kernel/power.h kernel/fat32.h kernel/ramfs.h kernel/blockio.h | $(BUILD)
+$(BUILD)/pmm.o: kernel/pmm.c kernel/pmm.h kernel/boot.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/pmm.c -o $(BUILD)/pmm.o
+
+$(BUILD)/heap.o: kernel/heap.c kernel/heap.h kernel/pmm.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/heap.c -o $(BUILD)/heap.o
+
+$(BUILD)/paging.o: kernel/paging.c kernel/paging.h kernel/pmm.h kernel/boot.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/paging.c -o $(BUILD)/paging.o
+
+$(BUILD)/interrupts_stubs.o: kernel/interrupts.asm | $(BUILD)
+	$(NASM) -f elf64 kernel/interrupts.asm -o $(BUILD)/interrupts_stubs.o
+
+$(BUILD)/interrupts.o: kernel/interrupts.c kernel/interrupts.h kernel/timer.h kernel/scheduler.h kernel/syscall.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/interrupts.c -o $(BUILD)/interrupts.o
+
+$(BUILD)/timer.o: kernel/timer.c kernel/timer.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/timer.c -o $(BUILD)/timer.o
+
+$(BUILD)/scheduler.o: kernel/scheduler.c kernel/scheduler.h kernel/timer.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/scheduler.c -o $(BUILD)/scheduler.o
+
+$(BUILD)/syscall.o: kernel/syscall.c kernel/syscall.h kernel/boot.h kernel/pmm.h kernel/heap.h kernel/paging.h kernel/scheduler.h kernel/power.h kernel/timer.h | $(BUILD)
+	$(CC) $(CFLAGS_KERNEL) -c kernel/syscall.c -o $(BUILD)/syscall.o
+
+$(BUILD)/shell.o: kernel/shell.c kernel/shell.h kernel/boot.h kernel/graphics.h kernel/keyboard.h kernel/power.h kernel/fat32.h kernel/ramfs.h kernel/blockio.h kernel/pmm.h kernel/heap.h kernel/paging.h kernel/interrupts.h kernel/timer.h kernel/scheduler.h kernel/syscall.h programs/clear.c programs/about.c programs/echo.c programs/halt.c programs/reboot.c programs/shutdown.c programs/fatinfo.c programs/fatpwd.c programs/fatls.c programs/fatcd.c programs/fatcat.c programs/fatmkdir.c programs/fattouch.c programs/fatwrite.c programs/fatflush.c programs/ramls.c programs/ramwrite.c programs/ramcat.c programs/ramrm.c programs/ramclear.c programs/meminfo.c programs/sched.c | $(BUILD)
 	$(CC) $(CFLAGS_KERNEL) -c kernel/shell.c -o $(BUILD)/shell.o
 
-$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUILD)/font.o $(BUILD)/keyboard.o $(BUILD)/power.o $(BUILD)/fat32.o $(BUILD)/ramfs.o $(BUILD)/blockio.o $(BUILD)/shell.o linker.ld
+$(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUILD)/font.o $(BUILD)/keyboard.o $(BUILD)/power.o $(BUILD)/fat32.o $(BUILD)/ramfs.o $(BUILD)/blockio.o $(BUILD)/pmm.o $(BUILD)/heap.o $(BUILD)/paging.o $(BUILD)/interrupts_stubs.o $(BUILD)/interrupts.o $(BUILD)/timer.o $(BUILD)/scheduler.o $(BUILD)/syscall.o $(BUILD)/shell.o linker.ld
 	$(LD_KERNEL) $(LDFLAGS_KERNEL) \
 		$(BUILD)/entry.o \
 		$(BUILD)/kernel.o \
@@ -63,6 +87,14 @@ $(BUILD)/$(KERNEL): $(BUILD)/entry.o $(BUILD)/kernel.o $(BUILD)/graphics.o $(BUI
 		$(BUILD)/fat32.o \
 		$(BUILD)/ramfs.o \
 		$(BUILD)/blockio.o \
+		$(BUILD)/pmm.o \
+		$(BUILD)/heap.o \
+		$(BUILD)/paging.o \
+		$(BUILD)/interrupts_stubs.o \
+		$(BUILD)/interrupts.o \
+		$(BUILD)/timer.o \
+		$(BUILD)/scheduler.o \
+		$(BUILD)/syscall.o \
 		$(BUILD)/shell.o \
 		-o $(BUILD)/$(KERNEL)
 

@@ -34,7 +34,6 @@ static void firmware_reset(boot_info_t* boot, uint32_t reset_type) {
 void power_shutdown(boot_info_t* boot) {
     (void)boot;
 
-    /* Legacy fallback for platforms without UEFI runtime reset. */
     port_out16(0x604u, 0x2000u);
     port_out16(0xB004u, 0x2000u);
     port_out16(0x4004u, 0x3400u);

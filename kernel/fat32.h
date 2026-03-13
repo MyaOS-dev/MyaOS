@@ -61,7 +61,6 @@ int fat32_write_file(
     uint32_t size
 );
 
-/* Backward-compatible wrappers for root directory commands. */
 int fat32_list_root(const fat32_fs_t* fs, fat32_dirent_t* entries, size_t max_entries, size_t* out_count);
 int fat32_read_root_file(
     const fat32_fs_t* fs,

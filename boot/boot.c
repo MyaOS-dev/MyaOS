@@ -798,6 +798,9 @@ static EFI_STATUS load_kernel_from_buffer(
     kernel_entry_raw_t* entry_out
 ) {
     EFI_STATUS status;
+    (void)mmap;
+    (void)mmap_size;
+    (void)desc_size;
     (void)kernel_size;
 
     dbg_putc('1');
@@ -849,20 +852,16 @@ static EFI_STATUS load_kernel_from_buffer(
     UINT64 image_end  = align_up(max_vaddr, PAGE_SIZE);
     UINT64 image_size = image_end - image_base;
 
-    EFI_PHYSICAL_ADDRESS load_base = 0;
-    status = find_free_region(
-        mmap,
-        mmap_size,
-        desc_size,
-        KERNEL_MIN_LOAD_ADDR,
-        image_size,
-        &load_base
-    );
-    if (EFI_ERROR(status)) {
-        Print(L"find_free_region failed: %r\r\n", status);
-        return status;
+    if (image_base < KERNEL_MIN_LOAD_ADDR) {
+        Print(L"kernel image base below minimum: %lx < %lx\r\n", image_base, KERNEL_MIN_LOAD_ADDR);
+        return EFI_LOAD_ERROR;
     }
 
+    /*
+     * Kernel is linked as a non-relocatable ELF (absolute addresses in code/data),
+     * so it must be loaded at its link-time base.
+     */
+    EFI_PHYSICAL_ADDRESS load_base = (EFI_PHYSICAL_ADDRESS)image_base;
     Print(L"kernel image base=%lx size=%lx chosen=%lx\r\n", image_base, image_size, load_base);
 
     EFI_PHYSICAL_ADDRESS alloc_addr = load_base;
@@ -890,14 +889,14 @@ static EFI_STATUS load_kernel_from_buffer(
         0
     );
 
-    INT64 slide = (INT64)load_base - (INT64)image_base;
+    INT64 slide = 0;
     Print(L"kernel slide=%lx\r\n", (UINT64)slide);
 
     for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr* ph = &phdrs[i];
         if (ph->p_type != PT_LOAD) continue;
 
-        UINT64 dst = (UINT64)((INT64)ph->p_vaddr + slide);
+        UINT64 dst = (UINT64)ph->p_vaddr;
 
         dbg_putc('5');
 
@@ -910,7 +909,7 @@ static EFI_STATUS load_kernel_from_buffer(
         );
     }
 
-    *entry_out = (kernel_entry_raw_t)(UINTN)((INT64)ehdr->e_entry + slide);
+    *entry_out = (kernel_entry_raw_t)(UINTN)ehdr->e_entry;
 
     dbg_putc('6');
     return EFI_SUCCESS;

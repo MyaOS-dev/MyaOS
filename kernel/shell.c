@@ -2,9 +2,15 @@
 #include "blockio.h"
 #include "fat32.h"
 #include "graphics.h"
+#include "heap.h"
 #include "keyboard.h"
+#include "paging.h"
+#include "pmm.h"
 #include "power.h"
 #include "ramfs.h"
+#include "scheduler.h"
+#include "syscall.h"
+#include "timer.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,7 +18,10 @@
 #define SHELL_CMD_MAX 32
 #define SHELL_TOKEN_MAX 64
 #define SHELL_FATCAT_MAX 1024
+#define SHELL_CMD_FILE_MAX 256
 #define FAT_PATH_DEPTH_MAX 16
+#define SHELL_CMD_BIN_VERSION 2u
+#define SHELL_CMD_DESC_MAX 48u
 
 typedef struct {
     boot_info_t* boot;
@@ -24,6 +33,47 @@ typedef struct {
     uint32_t cursor_row;
 } shell_state_t;
 
+typedef struct {
+    const char* name;
+    uint32_t api_addr;
+    uint32_t op_code;
+    const char* desc;
+} shell_command_manifest_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t magic[4];
+    uint16_t version;
+    uint16_t flags;
+    uint32_t api_addr;
+    uint32_t op_code;
+    char short_desc[SHELL_CMD_DESC_MAX];
+} shell_command_binary_t;
+
+static const shell_command_manifest_t g_command_manifest[] = {
+    { "clear", SHELL_API_CONSOLE, SHELL_OP_CONSOLE_CLEAR, "clear screen" },
+    { "about", SHELL_API_SYSTEM, SHELL_OP_SYSTEM_ABOUT, "show system info" },
+    { "echo", SHELL_API_SYSTEM, SHELL_OP_SYSTEM_ECHO, "print text" },
+    { "halt", SHELL_API_POWER, SHELL_OP_POWER_HALT, "stop CPU" },
+    { "reboot", SHELL_API_POWER, SHELL_OP_POWER_REBOOT, "restart machine" },
+    { "shutdown", SHELL_API_POWER, SHELL_OP_POWER_SHUTDOWN, "power off machine" },
+    { "fatinfo", SHELL_API_FAT, SHELL_OP_FAT_INFO, "show FAT32 info" },
+    { "fatpwd", SHELL_API_FAT, SHELL_OP_FAT_PWD, "show FAT32 path" },
+    { "fatls", SHELL_API_FAT, SHELL_OP_FAT_LS, "list FAT32 directory" },
+    { "fatcd", SHELL_API_FAT, SHELL_OP_FAT_CD, "change FAT32 directory" },
+    { "fatcat", SHELL_API_FAT, SHELL_OP_FAT_CAT, "read FAT32 file" },
+    { "fatmkdir", SHELL_API_FAT, SHELL_OP_FAT_MKDIR, "create FAT32 directory" },
+    { "fattouch", SHELL_API_FAT, SHELL_OP_FAT_TOUCH, "create FAT32 file" },
+    { "fatwrite", SHELL_API_FAT, SHELL_OP_FAT_WRITE, "write FAT32 file" },
+    { "fatflush", SHELL_API_FAT, SHELL_OP_FAT_FLUSH, "flush FAT32 writeback" },
+    { "ramls", SHELL_API_RAM, SHELL_OP_RAM_LS, "list RAMFS files" },
+    { "ramwrite", SHELL_API_RAM, SHELL_OP_RAM_WRITE, "write RAMFS file" },
+    { "ramcat", SHELL_API_RAM, SHELL_OP_RAM_CAT, "read RAMFS file" },
+    { "ramrm", SHELL_API_RAM, SHELL_OP_RAM_RM, "remove RAMFS file" },
+    { "ramclear", SHELL_API_RAM, SHELL_OP_RAM_CLEAR, "clear RAMFS" },
+    { "meminfo", SHELL_API_STATS, SHELL_OP_STATS_MEMINFO, "show memory subsystem info" },
+    { "sched", SHELL_API_STATS, SHELL_OP_STATS_SCHEDINFO, "show timer and scheduler stats" },
+};
+
 static shell_state_t g_shell;
 static fat32_fs_t g_fat32;
 static ramfs_t g_ramfs;
@@ -33,6 +83,11 @@ static uint8_t g_fat_dirty;
 static uint32_t g_fat_path_clusters[FAT_PATH_DEPTH_MAX];
 static char g_fat_path_names[FAT_PATH_DEPTH_MAX][FAT32_NAME_MAX];
 static uint32_t g_fat_path_depth;
+static uint8_t g_cmd_dir_ready;
+static uint32_t g_cmd_dir_cluster;
+static char g_input_buffer[SHELL_INPUT_MAX];
+static size_t g_input_len;
+static uint8_t g_prompt_shown;
 
 static size_t str_len(const char* s) {
     size_t n = 0;
@@ -66,6 +121,48 @@ static int str_eq(const char* a, const char* b) {
     return a[i] == b[i];
 }
 
+static void fill_command_binary(
+    shell_command_binary_t* out,
+    uint32_t api_addr,
+    uint32_t op_code,
+    const char* desc
+) {
+    uint8_t* bytes = (uint8_t*)(void*)out;
+    for (size_t i = 0; i < sizeof(*out); i++) {
+        bytes[i] = 0;
+    }
+
+    out->magic[0] = 'C';
+    out->magic[1] = 'M';
+    out->magic[2] = 'D';
+    out->magic[3] = '2';
+    out->version = SHELL_CMD_BIN_VERSION;
+    out->flags = 0;
+    out->api_addr = api_addr;
+    out->op_code = op_code;
+    str_copy(out->short_desc, desc ? desc : "", sizeof(out->short_desc));
+}
+
+static int command_binary_is_valid(const shell_command_binary_t* bin) {
+    if (!bin) {
+        return 0;
+    }
+
+    if (bin->magic[0] != 'C' || bin->magic[1] != 'M' || bin->magic[2] != 'D' || bin->magic[3] != '2') {
+        return 0;
+    }
+    if (bin->version != SHELL_CMD_BIN_VERSION) {
+        return 0;
+    }
+    if (bin->api_addr == 0) {
+        return 0;
+    }
+    if (bin->op_code == 0) {
+        return 0;
+    }
+    return 1;
+}
+
 static int is_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
@@ -94,6 +191,13 @@ static void to_lower_in_place(char* text) {
             text[i] = (char)(text[i] - 'A' + 'a');
         }
     }
+}
+
+static char to_upper_ascii(char c) {
+    if (c >= 'a' && c <= 'z') {
+        return (char)(c - 'a' + 'A');
+    }
+    return c;
 }
 
 static const char* skip_spaces(const char* text) {
@@ -156,6 +260,25 @@ static void u32_to_dec(uint32_t value, char* out, size_t out_size) {
     }
 
     char rev[16];
+    size_t n = 0;
+    do {
+        rev[n++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value && n < sizeof(rev));
+
+    size_t pos = 0;
+    while (n > 0 && pos + 1 < out_size) {
+        out[pos++] = rev[--n];
+    }
+    out[pos] = '\0';
+}
+
+static void u64_to_dec(uint64_t value, char* out, size_t out_size) {
+    if (out_size == 0) {
+        return;
+    }
+
+    char rev[32];
     size_t n = 0;
     do {
         rev[n++] = (char)('0' + (value % 10u));
@@ -271,6 +394,12 @@ static void console_write_u32(shell_state_t* shell, uint32_t value) {
     console_write(shell, buf);
 }
 
+static void console_write_u64(shell_state_t* shell, uint64_t value) {
+    char buf[32];
+    u64_to_dec(value, buf, sizeof(buf));
+    console_write(shell, buf);
+}
+
 static void console_write_binary_as_text(shell_state_t* shell, const uint8_t* data, uint32_t size) {
     for (uint32_t i = 0; i < size; i++) {
         char c = (char)data[i];
@@ -302,399 +431,218 @@ static void fat_path_reset(void) {
     g_fat_ready = 1;
 }
 
-static void cmd_help(shell_state_t* shell) {
-    console_write(shell, "help      show commands\n");
-    console_write(shell, "clear     clear screen\n");
-    console_write(shell, "echo      print text\n");
-    console_write(shell, "about     show system info\n");
-    console_write(shell, "halt      stop cpu\n");
-    console_write(shell, "reboot    restart machine\n");
-    console_write(shell, "shutdown  power off machine\n");
-    console_write(shell, "fatinfo   show FAT32 info\n");
-    console_write(shell, "fatpwd    show FAT32 path\n");
-    console_write(shell, "fatls     list current FAT32 dir\n");
-    console_write(shell, "fatcd     change FAT32 dir\n");
-    console_write(shell, "fatcat    read FAT32 file\n");
-    console_write(shell, "fatmkdir  create FAT32 dir\n");
-    console_write(shell, "fattouch  create FAT32 file\n");
-    console_write(shell, "fatwrite  write FAT32 file\n");
-    console_write(shell, "fatflush  write FAT32 blocks back\n");
-    console_write(shell, "ramls     list RAMFS files\n");
-    console_write(shell, "ramwrite  write RAMFS file\n");
-    console_write(shell, "ramcat    read RAMFS file\n");
-    console_write(shell, "ramrm     remove RAMFS file\n");
-    console_write(shell, "ramclear  clear RAMFS\n");
-}
-
-static void cmd_fatinfo(shell_state_t* shell) {
-    if (!g_fat32.mounted) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
+static int build_cmd_filename(const char* cmd, char* out, size_t out_size) {
+    if (!cmd || !out || out_size < 5) {
+        return -1;
     }
 
-    console_write(shell, "fat32 mounted\n");
-    console_write(shell, "bytes_per_sector: ");
-    console_write_u32(shell, g_fat32.bytes_per_sector);
-    console_put_char(shell, '\n');
-    console_write(shell, "sectors_per_cluster: ");
-    console_write_u32(shell, g_fat32.sectors_per_cluster);
-    console_put_char(shell, '\n');
-    console_write(shell, "reserved_sectors: ");
-    console_write_u32(shell, g_fat32.reserved_sectors);
-    console_put_char(shell, '\n');
-    console_write(shell, "fat_count: ");
-    console_write_u32(shell, g_fat32.fat_count);
-    console_put_char(shell, '\n');
-    console_write(shell, "sectors_per_fat: ");
-    console_write_u32(shell, g_fat32.sectors_per_fat);
-    console_put_char(shell, '\n');
-    console_write(shell, "total_sectors: ");
-    console_write_u32(shell, g_fat32.total_sectors);
-    console_put_char(shell, '\n');
-    console_write(shell, g_fat_demo_mode ? "source: demo image\n" : "source: boot disk\n");
+    size_t n = str_len(cmd);
+    if (n == 0 || n > 8 || n + 5 > out_size) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        out[i] = to_upper_ascii(cmd[i]);
+    }
+    out[n++] = '.';
+    out[n++] = 'C';
+    out[n++] = 'M';
+    out[n++] = 'D';
+    out[n] = '\0';
+    return 0;
 }
 
-static void cmd_fatpwd(shell_state_t* shell) {
+static int ensure_command_directory(void) {
     if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
+        return -1;
+    }
+
+    uint32_t root = fat32_root_cluster(&g_fat32);
+    fat32_dirent_t dir;
+    int rc = fat32_lookup(&g_fat32, root, "CMD", &dir);
+    if (rc != 0) {
+        rc = fat32_mkdir(&g_fat32, root, "CMD");
+        if (rc != 0 && rc != -2) {
+            return -1;
+        }
+        g_fat_dirty = 1;
+        rc = fat32_lookup(&g_fat32, root, "CMD", &dir);
+    }
+    if (rc != 0 || !dir.is_dir) {
+        return -1;
+    }
+
+    g_cmd_dir_cluster = dir.first_cluster;
+    g_cmd_dir_ready = 1;
+    return 0;
+}
+
+static void ensure_command_binary_files(void) {
+    if (ensure_command_directory() != 0) {
         return;
     }
 
-    console_put_char(shell, '/');
-    for (uint32_t i = 1; i <= g_fat_path_depth; i++) {
-        console_write(shell, g_fat_path_names[i]);
-        if (i != g_fat_path_depth) {
-            console_put_char(shell, '/');
+    for (size_t i = 0; i < sizeof(g_command_manifest) / sizeof(g_command_manifest[0]); i++) {
+        char filename[FAT32_NAME_MAX];
+        if (build_cmd_filename(g_command_manifest[i].name, filename, sizeof(filename)) != 0) {
+            continue;
+        }
+
+        shell_command_binary_t payload;
+        fill_command_binary(
+            &payload,
+            g_command_manifest[i].api_addr,
+            g_command_manifest[i].op_code,
+            g_command_manifest[i].desc
+        );
+
+        int should_write = 1;
+        fat32_dirent_t entry;
+        if (fat32_lookup(&g_fat32, g_cmd_dir_cluster, filename, &entry) == 0 && !entry.is_dir) {
+            uint8_t raw[sizeof(shell_command_binary_t)];
+            uint32_t read_size = 0;
+            if (fat32_read_file(
+                    &g_fat32,
+                    g_cmd_dir_cluster,
+                    filename,
+                    raw,
+                    (uint32_t)sizeof(raw),
+                    &read_size
+                ) == 0 && read_size == sizeof(raw)) {
+                const shell_command_binary_t* old = (const shell_command_binary_t*)(const void*)raw;
+                if (command_binary_is_valid(old)) {
+                    should_write = 0;
+                    const uint8_t* old_bytes = (const uint8_t*)(const void*)old;
+                    const uint8_t* new_bytes = (const uint8_t*)(const void*)&payload;
+                    for (size_t j = 0; j < sizeof(payload); j++) {
+                        if (old_bytes[j] != new_bytes[j]) {
+                            should_write = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!should_write) {
+            continue;
+        }
+
+        if (fat32_write_file(
+                &g_fat32,
+                g_cmd_dir_cluster,
+                filename,
+                (const uint8_t*)&payload,
+                (uint32_t)sizeof(payload)
+            ) == 0) {
+            g_fat_dirty = 1;
         }
     }
-    console_put_char(shell, '\n');
 }
 
-static void cmd_fatls(shell_state_t* shell) {
+static int resolve_command_from_disk(const char* cmd, uint32_t* out_api_addr, uint32_t* out_op_code) {
+    if (!g_cmd_dir_ready) {
+        return -1;
+    }
+
+    char filename[FAT32_NAME_MAX];
+    if (build_cmd_filename(cmd, filename, sizeof(filename)) != 0) {
+        return -1;
+    }
+
+    uint8_t raw[sizeof(shell_command_binary_t)];
+    uint32_t read_size = 0;
+    int rc = fat32_read_file(
+        &g_fat32,
+        g_cmd_dir_cluster,
+        filename,
+        raw,
+        (uint32_t)sizeof(raw),
+        &read_size
+    );
+    if (rc != 0 || read_size != sizeof(raw)) {
+        return -1;
+    }
+
+    const shell_command_binary_t* bin = (const shell_command_binary_t*)(const void*)raw;
+    if (!command_binary_is_valid(bin) || out_api_addr == NULL || out_op_code == NULL) {
+        return -1;
+    }
+
+    *out_api_addr = bin->api_addr;
+    *out_op_code = bin->op_code;
+    return 0;
+}
+
+static void cmd_help(shell_state_t* shell) {
     if (!g_fat_ready) {
         console_write(shell, "fat32 not mounted\n");
         return;
     }
-
-    fat32_dirent_t entries[32];
-    size_t count = 0;
-    int rc = fat32_list_dir(&g_fat32, fat_current_cluster(), entries, 32, &count);
-
-    if (rc == -1) {
-        console_write(shell, "fat32 read error\n");
+    if (ensure_command_directory() != 0) {
+        console_write(shell, "cmd directory unavailable\n");
         return;
     }
+
+    fat32_dirent_t entries[64];
+    size_t count = 0;
+    int rc = fat32_list_dir(&g_fat32, g_cmd_dir_cluster, entries, 64, &count);
+    if (rc == -1) {
+        console_write(shell, "cmd directory read failed\n");
+        return;
+    }
+
+    console_write(shell, "help - commands from /CMD\n");
     if (count == 0) {
-        console_write(shell, "fat32 dir is empty\n");
+        console_write(shell, "(no command files)\n");
         return;
     }
 
     for (size_t i = 0; i < count; i++) {
-        console_write(shell, entries[i].name);
         if (entries[i].is_dir) {
-            console_write(shell, " dir\n");
-        } else {
-            console_write(shell, " ");
-            console_write_u32(shell, entries[i].size);
-            console_write(shell, " bytes\n");
+            continue;
         }
+
+        char name[FAT32_NAME_MAX];
+        str_copy(name, entries[i].name, sizeof(name));
+        to_lower_in_place(name);
+        size_t n = str_len(name);
+        if (n > 4 && name[n - 4] == '.' && name[n - 3] == 'c' && name[n - 2] == 'm' && name[n - 1] == 'd') {
+            name[n - 4] = '\0';
+        }
+
+        char desc[SHELL_CMD_DESC_MAX + 1];
+        desc[0] = '\0';
+
+        uint8_t raw[sizeof(shell_command_binary_t)];
+        uint32_t read_size = 0;
+        if (fat32_read_file(
+                &g_fat32,
+                g_cmd_dir_cluster,
+                entries[i].name,
+                raw,
+                (uint32_t)sizeof(raw),
+                &read_size
+            ) == 0 && read_size == sizeof(raw)) {
+            const shell_command_binary_t* bin = (const shell_command_binary_t*)(const void*)raw;
+            if (command_binary_is_valid(bin)) {
+                str_copy(desc, bin->short_desc, sizeof(desc));
+            }
+        }
+
+        if (desc[0] == '\0') {
+            str_copy(desc, "(invalid command file)", sizeof(desc));
+        }
+
+        console_write(shell, name);
+        console_write(shell, " - ");
+        console_write(shell, desc);
+        console_put_char(shell, '\n');
     }
 
     if (rc == -2) {
         console_write(shell, "output truncated\n");
     }
-}
-
-static void cmd_fatcd(shell_state_t* shell, const char* args) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-
-    char target[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, target, sizeof(target), &rest)) {
-        console_write(shell, "usage: fatcd DIR\n");
-        return;
-    }
-    (void)rest;
-
-    if (str_eq(target, "/")) {
-        fat_path_reset();
-        return;
-    }
-
-    if (str_eq(target, "..")) {
-        if (g_fat_path_depth > 0) {
-            g_fat_path_depth--;
-        }
-        return;
-    }
-
-    fat32_dirent_t entry;
-    int rc = fat32_lookup(&g_fat32, fat_current_cluster(), target, &entry);
-    if (rc != 0) {
-        console_write(shell, "fat32 dir not found\n");
-        return;
-    }
-    if (!entry.is_dir) {
-        console_write(shell, "fat32 target is not dir\n");
-        return;
-    }
-    if (g_fat_path_depth + 1 >= FAT_PATH_DEPTH_MAX) {
-        console_write(shell, "fat32 path depth limit\n");
-        return;
-    }
-
-    g_fat_path_depth++;
-    g_fat_path_clusters[g_fat_path_depth] = entry.first_cluster;
-    str_copy(g_fat_path_names[g_fat_path_depth], entry.name, FAT32_NAME_MAX);
-}
-
-static void cmd_fatcat(shell_state_t* shell, const char* args) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: fatcat FILE\n");
-        return;
-    }
-    (void)rest;
-
-    uint8_t data[SHELL_FATCAT_MAX + 1];
-    uint32_t read_size = 0;
-    int rc = fat32_read_file(&g_fat32, fat_current_cluster(), name, data, SHELL_FATCAT_MAX, &read_size);
-
-    if (rc == -2) {
-        console_write(shell, "fat32 file not found\n");
-        return;
-    }
-    if (rc == -3) {
-        console_write(shell, "fat32 target is directory\n");
-        return;
-    }
-    if (rc == -4) {
-        console_write(shell, "fat32 file too large for buffer\n");
-        return;
-    }
-    if (rc != 0) {
-        console_write(shell, "fat32 read failed\n");
-        return;
-    }
-    if (read_size == 0) {
-        console_write(shell, "(empty)\n");
-        return;
-    }
-
-    data[read_size] = 0;
-    console_write_binary_as_text(shell, data, read_size);
-    if (data[read_size - 1] != '\n') {
-        console_put_char(shell, '\n');
-    }
-}
-
-static void cmd_fatmkdir(shell_state_t* shell, const char* args) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: fatmkdir DIR\n");
-        return;
-    }
-    (void)rest;
-
-    int rc = fat32_mkdir(&g_fat32, fat_current_cluster(), name);
-    if (rc == -2) {
-        console_write(shell, "fat32 entry exists\n");
-        return;
-    }
-    if (rc != 0) {
-        console_write(shell, "fat32 mkdir failed\n");
-        return;
-    }
-
-    console_write(shell, "fat32 mkdir ok\n");
-    g_fat_dirty = 1;
-}
-
-static void cmd_fattouch(shell_state_t* shell, const char* args) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: fattouch FILE\n");
-        return;
-    }
-    (void)rest;
-
-    int rc = fat32_create_file(&g_fat32, fat_current_cluster(), name);
-    if (rc == -2) {
-        console_write(shell, "fat32 entry exists\n");
-        return;
-    }
-    if (rc != 0) {
-        console_write(shell, "fat32 create failed\n");
-        return;
-    }
-
-    console_write(shell, "fat32 file created\n");
-    g_fat_dirty = 1;
-}
-
-static void cmd_fatwrite(shell_state_t* shell, const char* args) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-
-    char name[SHELL_TOKEN_MAX];
-    const char* text = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &text)) {
-        console_write(shell, "usage: fatwrite FILE TEXT\n");
-        return;
-    }
-
-    int rc = fat32_write_file(
-        &g_fat32,
-        fat_current_cluster(),
-        name,
-        (const uint8_t*)text,
-        (uint32_t)str_len(text)
-    );
-    if (rc == -3) {
-        console_write(shell, "fat32 target is directory\n");
-        return;
-    }
-    if (rc != 0) {
-        console_write(shell, "fat32 write failed\n");
-        return;
-    }
-
-    console_write(shell, "fat32 write ok\n");
-    g_fat_dirty = 1;
-}
-
-static void cmd_fatflush(shell_state_t* shell) {
-    if (!g_fat_ready) {
-        console_write(shell, "fat32 not mounted\n");
-        return;
-    }
-    if (g_fat_demo_mode) {
-        console_write(shell, "fat32 demo image cannot writeback\n");
-        return;
-    }
-    if (!g_fat_dirty) {
-        console_write(shell, "fat32 clean\n");
-        return;
-    }
-
-    int rc = blockio_writeback(shell->boot);
-    if (rc != 0) {
-        console_write(shell, "fat32 writeback failed\n");
-        return;
-    }
-
-    g_fat_dirty = 0;
-    console_write(shell, "fat32 writeback ok\n");
-}
-
-static void cmd_ramls(shell_state_t* shell) {
-    uint32_t count = ramfs_count(&g_ramfs);
-    if (count == 0) {
-        console_write(shell, "ramfs is empty\n");
-        return;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        const ramfs_file_t* file = ramfs_file_at(&g_ramfs, i);
-        if (!file) {
-            continue;
-        }
-
-        console_write(shell, file->name);
-        console_write(shell, " ");
-        console_write_u32(shell, file->size);
-        console_write(shell, " bytes\n");
-    }
-}
-
-static void cmd_ramwrite(shell_state_t* shell, const char* args) {
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: ramwrite NAME TEXT\n");
-        return;
-    }
-
-    int rc = ramfs_write(&g_ramfs, name, rest);
-    if (rc == -1) {
-        console_write(shell, "ramfs invalid name\n");
-        return;
-    }
-    if (rc == -2) {
-        console_write(shell, "ramfs text too long\n");
-        return;
-    }
-    if (rc == -3) {
-        console_write(shell, "ramfs is full\n");
-        return;
-    }
-
-    console_write(shell, "ramfs write ok\n");
-}
-
-static void cmd_ramcat(shell_state_t* shell, const char* args) {
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: ramcat NAME\n");
-        return;
-    }
-    (void)rest;
-
-    const char* data = NULL;
-    uint32_t size = 0;
-    if (ramfs_read(&g_ramfs, name, &data, &size) != 0) {
-        console_write(shell, "ramfs file not found\n");
-        return;
-    }
-    if (size == 0) {
-        console_write(shell, "(empty)\n");
-        return;
-    }
-
-    console_write_binary_as_text(shell, (const uint8_t*)data, size);
-    if (data[size - 1] != '\n') {
-        console_put_char(shell, '\n');
-    }
-}
-
-static void cmd_ramrm(shell_state_t* shell, const char* args) {
-    char name[SHELL_TOKEN_MAX];
-    const char* rest = NULL;
-    if (!parse_first_token(args, name, sizeof(name), &rest)) {
-        console_write(shell, "usage: ramrm NAME\n");
-        return;
-    }
-    (void)rest;
-
-    if (ramfs_remove(&g_ramfs, name) != 0) {
-        console_write(shell, "ramfs file not found\n");
-        return;
-    }
-    console_write(shell, "ramfs file removed\n");
 }
 
 static void fat_flush_if_needed(shell_state_t* shell) {
@@ -704,6 +652,110 @@ static void fat_flush_if_needed(shell_state_t* shell) {
 
     if (blockio_writeback(shell->boot) == 0) {
         g_fat_dirty = 0;
+    }
+}
+
+#include "../programs/clear.c"
+#include "../programs/about.c"
+#include "../programs/echo.c"
+#include "../programs/halt.c"
+#include "../programs/reboot.c"
+#include "../programs/shutdown.c"
+#include "../programs/fatinfo.c"
+#include "../programs/fatpwd.c"
+#include "../programs/fatls.c"
+#include "../programs/fatcd.c"
+#include "../programs/fatcat.c"
+#include "../programs/fatmkdir.c"
+#include "../programs/fattouch.c"
+#include "../programs/fatwrite.c"
+#include "../programs/fatflush.c"
+#include "../programs/ramls.c"
+#include "../programs/ramwrite.c"
+#include "../programs/ramcat.c"
+#include "../programs/ramrm.c"
+#include "../programs/ramclear.c"
+#include "../programs/meminfo.c"
+#include "../programs/sched.c"
+
+int shell_syscall_run_api(uint32_t api_addr, uint32_t op_code, const char* args) {
+    switch (api_addr) {
+    case SHELL_API_CONSOLE:
+        switch (op_code) {
+        case SHELL_OP_CONSOLE_CLEAR:
+            return program_clear_run(args);
+        default:
+            return -1;
+        }
+    case SHELL_API_SYSTEM:
+        switch (op_code) {
+        case SHELL_OP_SYSTEM_ABOUT:
+            return program_about_run(args);
+        case SHELL_OP_SYSTEM_ECHO:
+            return program_echo_run(args);
+        default:
+            return -1;
+        }
+    case SHELL_API_POWER:
+        switch (op_code) {
+        case SHELL_OP_POWER_HALT:
+            return program_halt_run(args);
+        case SHELL_OP_POWER_REBOOT:
+            return program_reboot_run(args);
+        case SHELL_OP_POWER_SHUTDOWN:
+            return program_shutdown_run(args);
+        default:
+            return -1;
+        }
+    case SHELL_API_FAT:
+        switch (op_code) {
+        case SHELL_OP_FAT_INFO:
+            return program_fatinfo_run(args);
+        case SHELL_OP_FAT_PWD:
+            return program_fatpwd_run(args);
+        case SHELL_OP_FAT_LS:
+            return program_fatls_run(args);
+        case SHELL_OP_FAT_CD:
+            return program_fatcd_run(args);
+        case SHELL_OP_FAT_CAT:
+            return program_fatcat_run(args);
+        case SHELL_OP_FAT_MKDIR:
+            return program_fatmkdir_run(args);
+        case SHELL_OP_FAT_TOUCH:
+            return program_fattouch_run(args);
+        case SHELL_OP_FAT_WRITE:
+            return program_fatwrite_run(args);
+        case SHELL_OP_FAT_FLUSH:
+            return program_fatflush_run(args);
+        default:
+            return -1;
+        }
+    case SHELL_API_RAM:
+        switch (op_code) {
+        case SHELL_OP_RAM_LS:
+            return program_ramls_run(args);
+        case SHELL_OP_RAM_WRITE:
+            return program_ramwrite_run(args);
+        case SHELL_OP_RAM_CAT:
+            return program_ramcat_run(args);
+        case SHELL_OP_RAM_RM:
+            return program_ramrm_run(args);
+        case SHELL_OP_RAM_CLEAR:
+            return program_ramclear_run(args);
+        default:
+            return -1;
+        }
+    case SHELL_API_STATS:
+        switch (op_code) {
+        case SHELL_OP_STATS_MEMINFO:
+            return program_meminfo_run(args);
+        case SHELL_OP_STATS_SCHEDINFO:
+            return program_sched_run(args);
+        default:
+            return -1;
+        }
+    default:
+        return -1;
     }
 }
 
@@ -724,105 +776,20 @@ static void shell_execute(shell_state_t* shell, const char* input_raw) {
         cmd_help(shell);
         return;
     }
-    if (str_eq(cmd, "clear")) {
-        console_reset(shell);
-        return;
-    }
-    if (str_eq(cmd, "about")) {
-        console_write(shell, "myaos kernel shell\n");
-        console_write(shell, "features: fat32 rw ramfs power\n");
-        return;
-    }
-    if (str_eq(cmd, "echo")) {
-        console_write(shell, args);
-        console_put_char(shell, '\n');
-        return;
-    }
-    if (str_eq(cmd, "halt")) {
-        fat_flush_if_needed(shell);
-        console_write(shell, "cpu halted\n");
-        for (;;) {
-            __asm__ __volatile__("cli; hlt");
-        }
-    }
-    if (str_eq(cmd, "reboot")) {
-        fat_flush_if_needed(shell);
-        console_write(shell, "rebooting\n");
-        power_reboot(shell->boot);
-        for (;;) {
-            __asm__ __volatile__("cli; hlt");
-        }
-    }
-    if (str_eq(cmd, "shutdown")) {
-        fat_flush_if_needed(shell);
-        console_write(shell, "powering off\n");
-        power_shutdown(shell->boot);
-        for (;;) {
-            __asm__ __volatile__("cli; hlt");
-        }
-    }
-    if (str_eq(cmd, "fatinfo")) {
-        cmd_fatinfo(shell);
-        return;
-    }
-    if (str_eq(cmd, "fatpwd")) {
-        cmd_fatpwd(shell);
-        return;
-    }
-    if (str_eq(cmd, "fatls")) {
-        cmd_fatls(shell);
-        return;
-    }
-    if (str_eq(cmd, "fatcd")) {
-        cmd_fatcd(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "fatcat")) {
-        cmd_fatcat(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "fatmkdir")) {
-        cmd_fatmkdir(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "fattouch")) {
-        cmd_fattouch(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "fatwrite")) {
-        cmd_fatwrite(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "fatflush")) {
-        cmd_fatflush(shell);
-        return;
-    }
-    if (str_eq(cmd, "ramls")) {
-        cmd_ramls(shell);
-        return;
-    }
-    if (str_eq(cmd, "ramwrite")) {
-        cmd_ramwrite(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "ramcat")) {
-        cmd_ramcat(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "ramrm")) {
-        cmd_ramrm(shell, args);
-        return;
-    }
-    if (str_eq(cmd, "ramclear")) {
-        ramfs_clear(&g_ramfs);
-        console_write(shell, "ramfs cleared\n");
+
+    uint32_t api_addr = 0;
+    uint32_t op_code = 0;
+    if (resolve_command_from_disk(cmd, &api_addr, &op_code) != 0) {
+        console_write(shell, "unknown command (no binary)\n");
         return;
     }
 
-    console_write(shell, "unknown command\n");
+    if (sys_run_api(api_addr, op_code, args) != 0) {
+        console_write(shell, "command execution failed\n");
+    }
 }
 
-void shell_start(boot_info_t* boot) {
+void shell_init(boot_info_t* boot) {
     g_shell.boot = boot;
     g_shell.fg = 0x00FFFFFFu;
     g_shell.bg = 0x00000000u;
@@ -842,6 +809,8 @@ void shell_start(boot_info_t* boot) {
     int fat_mount_rc = -1;
     g_fat_demo_mode = 0;
     g_fat_ready = 0;
+    g_cmd_dir_ready = 0;
+    g_cmd_dir_cluster = 0;
     if (boot->boot_disk_base != 0 && boot->boot_disk_size >= 512) {
         fat_mount_rc = fat32_mount(
             &g_fat32,
@@ -859,6 +828,13 @@ void shell_start(boot_info_t* boot) {
         fat_path_reset();
     }
     g_fat_dirty = 0;
+    if (fat_mount_rc == 0) {
+        ensure_command_binary_files();
+    }
+
+    g_input_len = 0;
+    g_input_buffer[0] = '\0';
+    g_prompt_shown = 0;
 
     console_reset(&g_shell);
     console_write(&g_shell, "myaos shell\n");
@@ -870,40 +846,51 @@ void shell_start(boot_info_t* boot) {
         console_write(&g_shell, "fat32 mount failed\n");
     }
     console_write(&g_shell, "type help\n\n");
+}
 
-    for (;;) {
-        char input[SHELL_INPUT_MAX];
-        size_t input_len = 0;
-
+void shell_step(void) {
+    if (!g_prompt_shown) {
         console_write(&g_shell, "myaos: ");
+        g_prompt_shown = 1;
+    }
 
-        for (;;) {
-            char c = keyboard_read_char();
-            if (c == 0) {
-                continue;
-            }
-            if (c == '\n') {
-                console_put_char(&g_shell, '\n');
-                input[input_len] = '\0';
-                shell_execute(&g_shell, input);
-                break;
-            }
-            if (c == '\b') {
-                if (input_len > 0) {
-                    input_len--;
-                    console_put_char(&g_shell, '\b');
-                }
-                continue;
-            }
-            if (c < 32 || c > 126) {
-                continue;
-            }
-            if (input_len + 1 >= sizeof(input)) {
-                continue;
-            }
-
-            input[input_len++] = c;
-            console_put_char(&g_shell, c);
+    char c = keyboard_read_char();
+    if (c == 0) {
+        return;
+    }
+    if (c == '\n') {
+        console_put_char(&g_shell, '\n');
+        g_input_buffer[g_input_len] = '\0';
+        shell_execute(&g_shell, g_input_buffer);
+        g_input_len = 0;
+        g_input_buffer[0] = '\0';
+        g_prompt_shown = 0;
+        return;
+    }
+    if (c == '\b') {
+        if (g_input_len > 0) {
+            g_input_len--;
+            g_input_buffer[g_input_len] = '\0';
+            console_put_char(&g_shell, '\b');
         }
+        return;
+    }
+    if (c < 32 || c > 126) {
+        return;
+    }
+    if (g_input_len + 1 >= sizeof(g_input_buffer)) {
+        return;
+    }
+
+    g_input_buffer[g_input_len++] = c;
+    g_input_buffer[g_input_len] = '\0';
+    console_put_char(&g_shell, c);
+}
+
+void shell_start(boot_info_t* boot) {
+    shell_init(boot);
+    for (;;) {
+        shell_step();
+        __asm__ __volatile__("hlt");
     }
 }
