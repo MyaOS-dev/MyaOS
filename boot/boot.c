@@ -1,7 +1,7 @@
 #include <efi.h>
 #include <efilib.h>
 #include <efidevp.h>
-#include "../kernel/boot.h"
+#include "../kernel/core/boot.h"
 
 typedef unsigned char  Elf64_Byte;
 typedef uint16_t       Elf64_Half;
@@ -114,12 +114,12 @@ static EFI_STATUS get_memory_map_alloc(
     mmap_size += desc_size * 16;
 
     status = uefi_call_wrapper(
-        SystemTable->BootServices->AllocatePool,
-        3,
-        EfiLoaderData,
-        mmap_size,
-        (void**)&mmap
-    );
+            SystemTable->BootServices->AllocatePool,
+            3,
+            EfiLoaderData,
+            mmap_size,
+            (void**)&mmap
+        );
     if (EFI_ERROR(status)) {
         return status;
     }
@@ -171,45 +171,64 @@ static EFI_STATUS get_memory_map_alloc(
     }
 }
 
-static EFI_STATUS find_free_region(
-    EFI_MEMORY_DESCRIPTOR* mmap,
-    UINTN mmap_size,
-    UINTN desc_size,
-    UINT64 min_addr,
-    UINT64 size_needed,
-    EFI_PHYSICAL_ADDRESS* out_addr
+static EFI_STATUS exit_boot_services_with_retry(
+    EFI_HANDLE ImageHandle,
+    EFI_SYSTEM_TABLE* SystemTable,
+    EFI_MEMORY_DESCRIPTOR** mmap_out,
+    UINTN* mmap_size_out,
+    UINTN* desc_size_out
 ) {
-    UINTN count = mmap_size / desc_size;
+    EFI_STATUS status = EFI_ABORTED;
+    EFI_MEMORY_DESCRIPTOR* mmap = NULL;
+    UINTN mmap_size = 0;
+    UINTN map_key = 0;
+    UINTN desc_size = 0;
+    UINT32 desc_version = 0;
 
-    for (UINTN i = 0; i < count; i++) {
-        EFI_MEMORY_DESCRIPTOR* desc =
-            (EFI_MEMORY_DESCRIPTOR*)((UINT8*)mmap + i * desc_size);
+    if (!mmap_out || !mmap_size_out || !desc_size_out) {
+        return EFI_INVALID_PARAMETER;
+    }
 
-        if (desc->Type != EfiConventionalMemory) {
-            continue;
+    *mmap_out = NULL;
+    *mmap_size_out = 0;
+    *desc_size_out = 0;
+
+    for (UINTN attempt = 0; attempt < 8u; attempt++) {
+        if (mmap != NULL) {
+            uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, mmap);
+            mmap = NULL;
         }
 
-        UINT64 region_start = desc->PhysicalStart;
-        UINT64 region_end = desc->PhysicalStart + desc->NumberOfPages * PAGE_SIZE;
-
-        if (region_end <= min_addr) {
-            continue;
+        status = get_memory_map_alloc(
+            SystemTable,
+            &mmap,
+            &mmap_size,
+            &map_key,
+            &desc_size,
+            &desc_version
+        );
+        if (EFI_ERROR(status)) {
+            return status;
         }
 
-        UINT64 candidate = region_start;
-        if (candidate < min_addr) {
-            candidate = min_addr;
-        }
-
-        candidate = align_up(candidate, PAGE_SIZE);
-
-        if (candidate + size_needed <= region_end) {
-            *out_addr = (EFI_PHYSICAL_ADDRESS)candidate;
+        status = uefi_call_wrapper(SystemTable->BootServices->ExitBootServices, 2, ImageHandle, map_key);
+        if (!EFI_ERROR(status)) {
+            *mmap_out = mmap;
+            *mmap_size_out = mmap_size;
+            *desc_size_out = desc_size;
             return EFI_SUCCESS;
+        }
+
+        if (status != EFI_INVALID_PARAMETER) {
+            uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, mmap);
+            return status;
         }
     }
 
-    return EFI_NOT_FOUND;
+    if (mmap != NULL) {
+        uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, mmap);
+    }
+    return status;
 }
 
 static CHAR16 char16_to_lower(CHAR16 c) {
@@ -790,9 +809,6 @@ static EFI_STATUS load_kernel_file(
 
 static EFI_STATUS load_kernel_from_buffer(
     EFI_SYSTEM_TABLE* SystemTable,
-    EFI_MEMORY_DESCRIPTOR* mmap,
-    UINTN mmap_size,
-    UINTN desc_size,
     const void* kernel_buffer,
     UINTN kernel_size,
     kernel_entry_raw_t* entry_out
@@ -849,20 +865,16 @@ static EFI_STATUS load_kernel_from_buffer(
     UINT64 image_end  = align_up(max_vaddr, PAGE_SIZE);
     UINT64 image_size = image_end - image_base;
 
-    EFI_PHYSICAL_ADDRESS load_base = 0;
-    status = find_free_region(
-        mmap,
-        mmap_size,
-        desc_size,
-        KERNEL_MIN_LOAD_ADDR,
-        image_size,
-        &load_base
-    );
-    if (EFI_ERROR(status)) {
-        Print(L"find_free_region failed: %r\r\n", status);
-        return status;
+    if (image_base < KERNEL_MIN_LOAD_ADDR) {
+        Print(L"kernel image base below minimum: %lx < %lx\r\n", image_base, KERNEL_MIN_LOAD_ADDR);
+        return EFI_LOAD_ERROR;
     }
 
+    /*
+     * Kernel is linked as a non-relocatable ELF (absolute addresses in code/data),
+     * so it must be loaded at its link-time base.
+     */
+    EFI_PHYSICAL_ADDRESS load_base = (EFI_PHYSICAL_ADDRESS)image_base;
     Print(L"kernel image base=%lx size=%lx chosen=%lx\r\n", image_base, image_size, load_base);
 
     EFI_PHYSICAL_ADDRESS alloc_addr = load_base;
@@ -890,14 +902,14 @@ static EFI_STATUS load_kernel_from_buffer(
         0
     );
 
-    INT64 slide = (INT64)load_base - (INT64)image_base;
+    INT64 slide = 0;
     Print(L"kernel slide=%lx\r\n", (UINT64)slide);
 
     for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr* ph = &phdrs[i];
         if (ph->p_type != PT_LOAD) continue;
 
-        UINT64 dst = (UINT64)((INT64)ph->p_vaddr + slide);
+        UINT64 dst = (UINT64)ph->p_vaddr;
 
         dbg_putc('5');
 
@@ -910,14 +922,14 @@ static EFI_STATUS load_kernel_from_buffer(
         );
     }
 
-    *entry_out = (kernel_entry_raw_t)(UINTN)((INT64)ehdr->e_entry + slide);
+    *entry_out = (kernel_entry_raw_t)(UINTN)ehdr->e_entry;
 
     dbg_putc('6');
     return EFI_SUCCESS;
 }
 
-static EFI_STATUS load_boot_volume_image(
-    EFI_HANDLE ImageHandle,
+static EFI_STATUS load_block_device_image_from_handle(
+    EFI_HANDLE DeviceHandle,
     EFI_SYSTEM_TABLE* SystemTable,
     EFI_PHYSICAL_ADDRESS* image_base_out,
     UINT64* image_size_out,
@@ -927,7 +939,6 @@ static EFI_STATUS load_boot_volume_image(
     UINT64* block_count_out
 ) {
     EFI_STATUS status;
-    EFI_LOADED_IMAGE_PROTOCOL* loaded_image = NULL;
     EFI_BLOCK_IO_PROTOCOL* block_io = NULL;
 
     *image_base_out = 0;
@@ -940,18 +951,7 @@ static EFI_STATUS load_boot_volume_image(
     status = uefi_call_wrapper(
         SystemTable->BootServices->HandleProtocol,
         3,
-        ImageHandle,
-        &loaded_image_guid,
-        (void**)&loaded_image
-    );
-    if (EFI_ERROR(status) || loaded_image == NULL) {
-        return EFI_NOT_FOUND;
-    }
-
-    status = uefi_call_wrapper(
-        SystemTable->BootServices->HandleProtocol,
-        3,
-        loaded_image->DeviceHandle,
+        DeviceHandle,
         &block_io_guid,
         (void**)&block_io
     );
@@ -1036,6 +1036,74 @@ static EFI_STATUS load_boot_volume_image(
     return EFI_SUCCESS;
 }
 
+static void store_boot_disk_info(
+    boot_disk_info_t* out,
+    EFI_PHYSICAL_ADDRESS image_base,
+    UINT64 image_size,
+    EFI_BLOCK_IO_PROTOCOL* block_io,
+    UINT32 media_id,
+    UINT32 block_size,
+    UINT64 block_count,
+    UINT32 is_boot
+) {
+    if (!out) {
+        return;
+    }
+
+    out->image_base = (uint64_t)image_base;
+    out->image_size = image_size;
+    out->efi_block_io = (uint64_t)(UINTN)block_io;
+    out->lba_start = 0;
+    out->block_count = block_count;
+    out->media_id = media_id;
+    out->block_size = block_size;
+    out->read_only = (block_io && block_io->Media) ? (uint32_t)block_io->Media->ReadOnly : 1u;
+    out->is_boot = is_boot;
+}
+
+static EFI_STATUS load_boot_volume_image(
+    EFI_HANDLE ImageHandle,
+    EFI_SYSTEM_TABLE* SystemTable,
+    EFI_PHYSICAL_ADDRESS* image_base_out,
+    UINT64* image_size_out,
+    EFI_BLOCK_IO_PROTOCOL** block_io_out,
+    UINT32* media_id_out,
+    UINT32* block_size_out,
+    UINT64* block_count_out
+) {
+    EFI_STATUS status;
+    EFI_LOADED_IMAGE_PROTOCOL* loaded_image = NULL;
+
+    *image_base_out = 0;
+    *image_size_out = 0;
+    *block_io_out = NULL;
+    *media_id_out = 0;
+    *block_size_out = 0;
+    *block_count_out = 0;
+
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->HandleProtocol,
+        3,
+        ImageHandle,
+        &loaded_image_guid,
+        (void**)&loaded_image
+    );
+    if (EFI_ERROR(status) || loaded_image == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    return load_block_device_image_from_handle(
+        loaded_image->DeviceHandle,
+        SystemTable,
+        image_base_out,
+        image_size_out,
+        block_io_out,
+        media_id_out,
+        block_size_out,
+        block_count_out
+    );
+}
+
 EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
     dbg_putc('A');
@@ -1102,6 +1170,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     if (EFI_ERROR(status)) {
         fatal(SystemTable, L"boot_info alloc failed", status);
     }
+    uefi_call_wrapper(SystemTable->BootServices->SetMem, 3, boot_info, sizeof(boot_info_t), 0);
 
     dbg_putc('K');
 
@@ -1131,27 +1200,84 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
         dbg_putc('v');
     } else {
         dbg_putc('w');
+        store_boot_disk_info(
+            &boot_info->disks[0],
+            boot_disk_base,
+            boot_disk_size,
+            boot_block_io,
+            boot_disk_media_id,
+            boot_disk_block_size,
+            boot_disk_block_count,
+            1u
+        );
+        boot_info->disk_count = 1u;
     }
 
-    EFI_MEMORY_DESCRIPTOR* mmap = NULL;
-    UINTN mmap_size = 0;
-    UINTN map_key = 0;
-    UINTN desc_size = 0;
-    UINT32 desc_version = 0;
-
-    status = get_memory_map_alloc(
-        SystemTable,
-        &mmap,
-        &mmap_size,
-        &map_key,
-        &desc_size,
-        &desc_version
+    EFI_LOADED_IMAGE_PROTOCOL* loaded_image = NULL;
+    EFI_HANDLE boot_device_handle = NULL;
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->HandleProtocol,
+        3,
+        ImageHandle,
+        &loaded_image_guid,
+        (void**)&loaded_image
     );
-    if (EFI_ERROR(status)) {
-        fatal(SystemTable, L"Get memory map before kernel load failed", status);
+    if (!EFI_ERROR(status) && loaded_image != NULL) {
+        boot_device_handle = loaded_image->DeviceHandle;
     }
 
-    dbg_putc('M');
+    EFI_HANDLE* block_handles = NULL;
+    UINTN block_handle_count = 0;
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->LocateHandleBuffer,
+        5,
+        ByProtocol,
+        &block_io_guid,
+        NULL,
+        &block_handle_count,
+        &block_handles
+    );
+    if (!EFI_ERROR(status) && block_handles != NULL) {
+        for (UINTN i = 0; i < block_handle_count && boot_info->disk_count < BOOT_MAX_DISKS; i++) {
+            EFI_PHYSICAL_ADDRESS disk_base = 0;
+            UINT64 disk_size = 0;
+            EFI_BLOCK_IO_PROTOCOL* disk_block_io = NULL;
+            UINT32 disk_media_id = 0;
+            UINT32 disk_block_size = 0;
+            UINT64 disk_block_count = 0;
+
+            if (boot_device_handle != NULL && block_handles[i] == boot_device_handle) {
+                continue;
+            }
+
+            status = load_block_device_image_from_handle(
+                block_handles[i],
+                SystemTable,
+                &disk_base,
+                &disk_size,
+                &disk_block_io,
+                &disk_media_id,
+                &disk_block_size,
+                &disk_block_count
+            );
+            if (EFI_ERROR(status)) {
+                continue;
+            }
+
+            store_boot_disk_info(
+                &boot_info->disks[boot_info->disk_count],
+                disk_base,
+                disk_size,
+                disk_block_io,
+                disk_media_id,
+                disk_block_size,
+                disk_block_count,
+                0u
+            );
+            boot_info->disk_count++;
+        }
+        uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, block_handles);
+    }
 
     void* kernel_file_buffer = NULL;
     UINTN kernel_file_size = 0;
@@ -1170,9 +1296,6 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     kernel_entry_raw_t kernel_entry = NULL;
     status = load_kernel_from_buffer(
         SystemTable,
-        mmap,
-        mmap_size,
-        desc_size,
         kernel_file_buffer,
         kernel_file_size,
         &kernel_entry
@@ -1184,14 +1307,26 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
 
     uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, kernel_file_buffer);
 
+    EFI_MEMORY_DESCRIPTOR* final_mmap = NULL;
+    UINTN final_mmap_size = 0;
+    UINTN final_desc_size = 0;
+    status = exit_boot_services_with_retry(
+        ImageHandle,
+        SystemTable,
+        &final_mmap,
+        &final_mmap_size,
+        &final_desc_size
+    );
+    if (EFI_ERROR(status)) {
+        fatal(SystemTable, L"ExitBootServices failed", status);
+    }
+
     dbg_putc('F');
-    (void)map_key;
-    (void)desc_version;
 
     boot_info->fb = *fb_ptr;
-    boot_info->mmap = (uint64_t)(UINTN)mmap;
-    boot_info->mmap_size = (uint64_t)mmap_size;
-    boot_info->desc_size = (uint64_t)desc_size;
+    boot_info->mmap = (uint64_t)(UINTN)final_mmap;
+    boot_info->mmap_size = (uint64_t)final_mmap_size;
+    boot_info->desc_size = (uint64_t)final_desc_size;
     boot_info->boot_disk_base = (uint64_t)boot_disk_base;
     boot_info->boot_disk_size = (uint64_t)boot_disk_size;
     boot_info->efi_reset_system = (uint64_t)(UINTN)SystemTable->RuntimeServices->ResetSystem;
@@ -1203,7 +1338,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     boot_info->boot_disk_read_only = (boot_block_io && boot_block_io->Media)
         ? (uint32_t)boot_block_io->Media->ReadOnly
         : 1u;
-    boot_info->boot_services_active = 1u;
+    boot_info->boot_services_active = 0u;
 
     dbg_putc('L');
 
