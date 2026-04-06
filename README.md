@@ -1,252 +1,162 @@
-# MyaOS_EN
+# MyaOS
 
-MyaOS is an experimental operating system written completely from scratch.
+MyaOS is an experimental x86_64 operating system with a UEFI boot path, a modular kernel layout, a VFS layer, a syscall ABI, and loadable ELF command programs.
 
-Unlike many hobby operating systems, MyaOS is not Unix-based.  
-It is designed as an independent system with its own architecture, kernel, package ecosystem, and user interface.
+## Current State
 
-The long-term goal of MyaOS is to explore operating system design while eventually supporting software from other ecosystems such as Linux and Windows.
+The kernel now includes:
 
----
+- `kernel/arch/x86_64/` for interrupt/entry code
+- `kernel/arch/portable/` for secondary architecture profile stubs
+- `kernel/core/` for boot data, console, shell, and syscall dispatch
+- `kernel/mm/` for PMM, heap, paging, and explicit swap
+- `kernel/fs/` for FAT32, RAMFS, VFS, and filesystem adapters
+- `kernel/dev/` for the common device layer and device-facing drivers
+- `kernel/proc/` for the scheduler/process model and ELF loader
+- `kernel/gfx/` for framebuffer graphics and font rendering
 
-# Goals
+The shell is intentionally small. It handles input, `help`, `cd`, command lookup from `/cmd` (with `/boot/cmd` fallback), and execution. Regular commands are built as ELF programs and loaded from `/bin` (with `/boot/bin` fallback).
 
-The main goals of MyaOS are:
+## Process Model
 
-- independent operating system architecture
-- modern kernel design
-- modular system components
-- extensible package ecosystem
-- compatibility with multiple software ecosystems
+The scheduler now tracks real process metadata:
 
-MyaOS focuses on experimentation and learning in low-level system development.
+- PID and PPID
+- states: `running`, `ready`, `blocked`, `sleeping`, `zombie`
+- per-process working directory
+- loadable ELF entrypoints
+- `spawn`, `exec`, `wait`, `exit`, `yield`, and `sleep`
 
----
+External command programs now run in ring 3 with a ring 0 syscall boundary.
+Kernel service tasks (shell/idle) remain ring 0.
+Per-process user page tables and user memory regions are active.
 
-# Planned Features
+## Filesystems
 
-## Kernel
+MyaOS now uses a VFS layer with mount points:
 
-- custom kernel written from scratch
-- x86_64 architecture
-- UEFI boot support
-- multitasking
-- memory management
-- interrupt and device driver systems
-- modular kernel components
+- `/` backed by MyaFS (standard/default filesystem)
+- `/boot` backed by FAT32 boot disk when available (or demo FAT32 fallback)
+- `/ram` backed by RAMFS
+- `/mya` compatibility mount backed by the same MyaFS instance
+- `/dvc` and `/dev` virtual device views
+- `/prc` and `/proc` virtual process views
+- extra disks can be enumerated and mounted later through the `attach` command
 
----
+Disk probing currently recognizes:
 
-## Graphics
+- `fat32`
+- `ext2`, `ext3`, `ext4`
+- `ntfs`
 
-MyaOS will include its own graphical environment, implemented as a separate installable package.
+Mounted filesystems currently supported through VFS:
 
-Planned features include:
+- `fat32`
+- `ext2`, `ext3`, `ext4`
+- `ramfs`
+- `myafs`
 
-- custom window system
-- compositing window manager
-- desktop environment
-- future hardware acceleration
+`myafs` is implemented in-kernel in MyaOS (`kernel/fs/vfs_myafs.c`) and mounted as the default root filesystem.
 
-The graphical interface will not be required for the base system.
+`ntfs` is still probe-only.
 
----
+`ext*` write support is staged by safety level:
 
-## Package Manager
+- level 0: read-only fallback when journal recovery is required
+- level 1: limited write support (small legacy-mapped file updates)
+- level 2: wider legacy block-map write support (including indirect block paths)
 
-MyaOS will include its own package manager.
+Generic filesystem commands now operate through the VFS instead of filesystem-specific shell logic. Current packaged commands include:
 
-Planned features:
+- `list`, `show`, `mkfolder`, `newfile`, `save`, `del`, `whereami`, `attached`, `attach`
+- `about`, `add`, `cate`, `cls`, `say`, `pause`, `msh`, `uname`, `kill`, `compat`
+- `meminfo`, `sched`, `tasks`, `devls`, `disks`, `swapstat`, `swapcheck`, `dlcheck`, `posixcheck`
+- text tools: `findtext`, `count`, `firstlines`
+- control/status helpers: `ok`, `fail`
+- lightweight IPC tools: `notify`, `notifypoll`, `msgsend`, `msgrecv`
+- `stop`, `restart`, `poweroff`, `hotplug`, `modctl`
 
-- native MyaOS packages
-- dependency resolution
-- package repositories
-- system and user packages
+`help` and `cd` stay built into the shell.  
+Shell parsing now supports quotes/escapes, `;`, `&&`, `||`, redirection (`>`, `>>`), and a basic single-pipe flow (temp-file bridge).
 
----
+## Syscall ABI
 
-## Software Compatibility
+The shared ABI lives in [`include/myaos/syscall.h`](/home/timur/Desktop/myaos/include/myaos/syscall.h). It exposes:
 
-Even though MyaOS is not Unix-based, compatibility layers are planned.
+- console syscalls
+- file/VFS syscalls
+- process syscalls
+- module list/load/unload syscalls
+- user memory map/swap syscalls
+- device enumeration and hot-plug syscalls
+- system and memory info syscalls
 
-Future goals include:
+Programs under `programs/` only use that ABI through [`programs/lib/myaos.h`](/home/timur/Desktop/myaos/programs/lib/myaos.h).
 
-- ability to run some Linux packages
-- compatibility layer for Windows applications
-- support for external package formats
-- tools for porting existing software
+## Build
 
-These compatibility features will be optional components.
+Build everything:
 
----
+```bash
+make
+```
 
-## File Systems
+By default this produces an optimized build (`-O2`).  
+For developer diagnostics build with symbols and no optimization:
 
-MyaOS will support multiple file systems.
+```bash
+make MYAOS_DEBUG=1
+```
 
-Planned support includes:
+Run in QEMU:
 
-- native MyaFS
-- modular filesystem drivers
-- compatibility with common file systems
+```bash
+make run
+```
 
----
+Debug boot with QEMU logging:
 
-# Current Status
+```bash
+make debug
+```
 
-MyaOS is currently in early development.
+Debug shell startup with symbols (QEMU waits for GDB on `:1234`):
 
-Current focus:
+```bash
+make debug-shell
+```
 
-- boot process
-- kernel architecture
-- hardware abstraction
-- system core components
+In another terminal:
 
-Most features listed above are planned for future versions.
+```bash
+make gdb-shell
+```
 
----
+`/autorun.sh` is now packaged into the ESP image and runs at shell startup (via `/boot/autorun.sh` when `/` is MyaFS).  
+The default script keeps shell debug mode disabled and launches `msh`.
 
-# Development Philosophy
+The Makefile now builds kernel sources from subdirectories, builds ELF programs separately, packages them into the boot image `/bin`, packages shared libraries into `/lib`, and copies command manifests into `/cmd`.
 
-MyaOS is designed as an experimental and educational project focused on:
+For cross-platform host tooling, see the portable MyaFS driver docs: `docs/MYAFS_DRIVER.md`.
+That doc also includes the Linux host kernel filesystem module (`tools/myafs_host_linux`).
 
-- operating system design
-- kernel development
-- low-level programming
-- system architecture
+## Docs
 
-The project prioritizes flexibility and experimentation over strict compatibility with existing systems.
+- [Architecture](docs/ARCHITECTURE.md)
+- [Syscalls](docs/SYSCALLS.md)
+- [VFS](docs/VFS.md)
+- [Processes](docs/PROCESSES.md)
+- [MyaFS Host Driver](docs/MYAFS_DRIVER.md)
+- [Packages](docs/PACKAGES.md)
+- [Compatibility Policy](docs/COMPATIBILITY.md)
+- [Kernel Modules](docs/MODULES.md)
+- [Portability Profiles](docs/PORTABILITY.md)
 
----
+## Near-Term Direction
 
-# License
-
-MyaOS is licensed under the GNU General Public License v2 (GPLv2), the same license used by the Linux kernel.
-
-This ensures that the project remains open source and compatible with software and components released under GPLv2.
-
----
-
-# Developer
-
-MyaOS-dev
-
-
-
-
-# MyaOS_RU
-MyaOS — экспериментальная операционная система, полностью написанная с нуля.
-
-В отличие от многих hobby-ОС, MyaOS не является Unix-подобной системой.  
-Она разрабатывается как независимая операционная система со своей архитектурой ядра, системой пакетов и пользовательской средой.
-
-Долгосрочная цель MyaOS — создать гибкую систему, которая сможет запускать собственные программы, а также поддерживать программное обеспечение из других экосистем.
-
----
-
-# Цели проекта
-
-Основные цели MyaOS:
-
-- независимая архитектура операционной системы
-- современный дизайн ядра
-- модульная структура системы
-- собственная система пакетов
-- поддержка разных программных экосистем
-
-Проект ориентирован на изучение разработки операционных систем и эксперименты с архитектурой ядра.
-
----
-
-# Планируемые возможности
-
-## Ядро
-
-- собственное ядро, написанное с нуля
-- поддержка архитектуры x86_64
-- загрузка через UEFI
-- многозадачность
-- управление памятью
-- система прерываний и драйверов
-- модульная архитектура ядра
-
----
-
-## Графический интерфейс
-
-MyaOS будет иметь собственную графическую среду, которая будет распространяться как отдельный пакет.
-
-Планируемые возможности:
-
-- собственная оконная система
-- композитный оконный менеджер
-- рабочий стол
-- в будущем — аппаратное ускорение графикиГрафический интерфейс не будет обязательным для базовой системы.
-
----
-
-## Пакетный менеджер
-
-MyaOS будет иметь собственный пакетный менеджер.
-
-Планируемые возможности:
-
-- нативные пакеты MyaOS
-- управление зависимостями
-- репозитории пакетов
-- системные и пользовательские пакеты
-
----
-
-## Совместимость программ
-
-Хотя MyaOS не является Unix-подобной системой, в будущем планируются слои совместимости.
-
-Планируемые возможности:
-
-- запуск некоторых Linux-пакетов
-- слой совместимости для Windows-приложений
-- поддержка внешних форматов пакетов
-- инструменты для портирования программ
-
-Эти возможности будут реализованы как дополнительные компоненты системы.
-
----
-
-## Файловые системы
-
-MyaOS будет поддерживать несколько файловых систем.
-
-Планируется:
-
-- собственная файловая система MyaFS
-- модульные драйверы файловых систем
-- поддержка распространённых файловых систем
-
----
-
-# Текущий статус
-
-MyaOS находится на ранней стадии разработки.
-
-Основной фокус сейчас:
-
-- процесс загрузки системы
-- архитектура ядра
-- абстракция оборудования
-- базовые компоненты системы
-
-Большинство перечисленных возможностей планируются для будущих версий.
-
----
-
-# Лицензия
-
-MyaOS распространяется под лицензией GNU General Public License v2 (GPLv2) — той же лицензией, что используется в ядре Linux.
-
----
-
-# Разработчик
-
-MyaOS-dev
+- stronger ELF loading validation
+- better process reaping and parent/child handling
+- more VFS operations and filesystem drivers
+- richer dynamic loader features (relocations/import resolution)
+- stronger compatibility coverage for POSIX-style userspace
+- more robust module lifecycle hooks for optional components
