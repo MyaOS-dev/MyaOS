@@ -7,11 +7,13 @@
 #include "vfs_extfs.h"
 #include "vfs_fat32.h"
 #include "vfs_myafs.h"
+#include "vfs_ntfs.h"
 #include "vfs_ramfs.h"
 #include <myaos/syscall.h>
 
 #define FS_DRIVER_FAT_MOUNTS VFS_MAX_MOUNTS
 #define FS_DRIVER_EXT_MOUNTS VFS_MAX_MOUNTS
+#define FS_DRIVER_NTFS_MOUNTS VFS_MAX_MOUNTS
 #define FS_DRIVER_RAMFS_MOUNTS 4u
 #define FS_DRIVER_MYAFS_MOUNTS 4u
 
@@ -19,6 +21,8 @@ static vfs_fat32_t g_fat_mounts[FS_DRIVER_FAT_MOUNTS];
 static uint8_t g_fat_mount_used[FS_DRIVER_FAT_MOUNTS];
 static vfs_extfs_t g_ext_mounts[FS_DRIVER_EXT_MOUNTS];
 static uint8_t g_ext_mount_used[FS_DRIVER_EXT_MOUNTS];
+static vfs_ntfs_t g_ntfs_mounts[FS_DRIVER_NTFS_MOUNTS];
+static uint8_t g_ntfs_mount_used[FS_DRIVER_NTFS_MOUNTS];
 static vfs_ramfs_t g_ramfs_mounts[FS_DRIVER_RAMFS_MOUNTS];
 static uint8_t g_ramfs_mount_used[FS_DRIVER_RAMFS_MOUNTS];
 static vfs_myafs_t g_myafs_mounts[FS_DRIVER_MYAFS_MOUNTS];
@@ -176,6 +180,22 @@ static int alloc_ext_mount_slot(void) {
 static void release_ext_mount_slot(int slot) {
     if (slot >= 0 && (uint32_t)slot < FS_DRIVER_EXT_MOUNTS) {
         g_ext_mount_used[slot] = 0;
+    }
+}
+
+static int alloc_ntfs_mount_slot(void) {
+    for (uint32_t i = 0; i < FS_DRIVER_NTFS_MOUNTS; i++) {
+        if (!g_ntfs_mount_used[i]) {
+            g_ntfs_mount_used[i] = 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void release_ntfs_mount_slot(int slot) {
+    if (slot >= 0 && (uint32_t)slot < FS_DRIVER_NTFS_MOUNTS) {
+        g_ntfs_mount_used[slot] = 0;
     }
 }
 
@@ -337,12 +357,41 @@ static int mount_myafs_disk(uint32_t disk_id, const char* mount_path) {
     return 0;
 }
 
+static int mount_ntfs_disk(uint32_t disk_id, const char* mount_path) {
+    const blockio_disk_t* disk = blockio_get_disk(disk_id);
+    int slot;
+
+    if (!disk) {
+        return -1;
+    }
+
+    slot = alloc_ntfs_mount_slot();
+    if (slot < 0) {
+        return -1;
+    }
+
+    if (vfs_ntfs_mount_disk(&g_ntfs_mounts[slot], disk) != 0) {
+        release_ntfs_mount_slot(slot);
+        return -1;
+    }
+
+    if (vfs_mount(mount_path, "ntfs", disk->name, disk_id, (uint8_t)disk->read_only, &g_ntfs_mounts[slot], vfs_ntfs_ops()) != 0) {
+        release_ntfs_mount_slot(slot);
+        return -1;
+    }
+
+    return 0;
+}
+
 void fs_driver_init(void) {
     for (uint32_t i = 0; i < FS_DRIVER_FAT_MOUNTS; i++) {
         g_fat_mount_used[i] = 0;
     }
     for (uint32_t i = 0; i < FS_DRIVER_EXT_MOUNTS; i++) {
         g_ext_mount_used[i] = 0;
+    }
+    for (uint32_t i = 0; i < FS_DRIVER_NTFS_MOUNTS; i++) {
+        g_ntfs_mount_used[i] = 0;
     }
     for (uint32_t i = 0; i < FS_DRIVER_RAMFS_MOUNTS; i++) {
         g_ramfs_mount_used[i] = 0;
@@ -416,7 +465,7 @@ int fs_driver_mount_source(const char* source, const char* mount_path, const cha
             return mount_ext_disk(disk_id, mount_path);
         }
         if (probe_ntfs_disk(disk)) {
-            return -2;
+            return mount_ntfs_disk(disk_id, mount_path);
         }
         return -1;
     }
@@ -432,7 +481,7 @@ int fs_driver_mount_source(const char* source, const char* mount_path, const cha
         return str_eq_ci(fs_name, ext_name) ? mount_ext_disk(disk_id, mount_path) : -1;
     }
     if (str_eq_ci(fs_name, "ntfs") && probe_ntfs_disk(disk)) {
-        return -2;
+        return mount_ntfs_disk(disk_id, mount_path);
     }
 
     return -1;

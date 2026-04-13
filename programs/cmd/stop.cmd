@@ -1,2 +1,2 @@
-/bin/stop.elf
-stop the machine
+exec=/bin/stop.elf
+stop <service> or power off the machine

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define FAT32_NAME_MAX 13
+#define FAT32_NAME_MAX 32
 
 typedef struct {
     char name[FAT32_NAME_MAX];

@@ -1,2 +1,2 @@
 exec=/bin/dlcheck.elf
-dynamic loader shared-library self-check
+dynamic linker shared-library self-check

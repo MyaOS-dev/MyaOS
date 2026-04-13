@@ -27,15 +27,51 @@
 #define SCHED_MAX_PIPES 32u
 #define SCHED_MAX_PIPE_HANDLES 16u
 #define SCHED_PIPE_BUFFER_SIZE 1024u
+#define SCHED_MAX_FILE_HANDLES 32u
+#define SCHED_POSIX_FILE_MAX (16u * 1024u * 1024u)
 #define SCHED_MAX_USERS 8u
 #define SCHED_MAX_SHM_SEGMENTS 32u
 #define SCHED_SHM_DATA_MAX 4096u
 #define PIPE_MODE_READ 1u
 #define PIPE_MODE_WRITE 2u
+#define FILE_MODE_READ 1u
+#define FILE_MODE_WRITE 2u
 #define SCHED_WAIT_NOTIFY_SENTINEL ((int32_t)0x80000000u)
 #define SCHED_PRIO_BUDGET_LOW 1u
 #define SCHED_PRIO_BUDGET_NORMAL 2u
 #define SCHED_PRIO_BUDGET_HIGH 4u
+#define SCHED_POSIX_S_IFREG 0100000u
+#define SCHED_LINUX_ARGV_MAX 64u
+#define IA32_FS_BASE_MSR 0xC0000100u
+#define LINUX_AT_NULL 0u
+#define LINUX_AT_PHDR 3u
+#define LINUX_AT_PHENT 4u
+#define LINUX_AT_PHNUM 5u
+#define LINUX_AT_PAGESZ 6u
+#define LINUX_AT_BASE 7u
+#define LINUX_AT_FLAGS 8u
+#define LINUX_AT_ENTRY 9u
+#define LINUX_AT_UID 11u
+#define LINUX_AT_EUID 12u
+#define LINUX_AT_GID 13u
+#define LINUX_AT_EGID 14u
+#define LINUX_AT_CLKTCK 17u
+#define LINUX_AT_SECURE 23u
+#define LINUX_AT_RANDOM 25u
+#define LINUX_AT_EXECFN 31u
+#define LINUX_CLONE_VM 0x00000100u
+#define LINUX_CLONE_SIGHAND 0x00000800u
+#define LINUX_CLONE_VFORK 0x00004000u
+#define LINUX_CLONE_THREAD 0x00010000u
+#define LINUX_CLONE_SETTLS 0x00080000u
+#define LINUX_CLONE_PARENT_SETTID 0x00100000u
+#define LINUX_CLONE_CHILD_CLEARTID 0x00200000u
+#define LINUX_CLONE_CHILD_SETTID 0x01000000u
+#define LINUX_CLONE_SIGNAL_MASK 0x000000FFu
+#define LINUX_CLONE_SUPPORTED_FLAGS                                                       \
+    (LINUX_CLONE_VM | LINUX_CLONE_SIGHAND | LINUX_CLONE_VFORK | LINUX_CLONE_THREAD |     \
+     LINUX_CLONE_SETTLS | LINUX_CLONE_PARENT_SETTID | LINUX_CLONE_CHILD_CLEARTID |       \
+     LINUX_CLONE_CHILD_SETTID)
 
 typedef struct {
     uint64_t rax;
@@ -86,6 +122,20 @@ typedef struct {
 
 typedef struct {
     uint8_t used;
+    uint8_t readable;
+    uint8_t writable;
+    uint8_t append;
+    uint8_t dirty;
+    uint8_t reserved0[3];
+    uint32_t size;
+    uint32_t capacity;
+    uint32_t offset;
+    char abs_path[MYAOS_PATH_MAX];
+    uint8_t* data;
+} proc_file_handle_t;
+
+typedef struct {
+    uint8_t used;
     uint8_t reserved0[3];
     uint32_t readers;
     uint32_t writers;
@@ -114,7 +164,7 @@ typedef struct {
     uint8_t used;
     uint8_t user_mode;
     uint8_t thread_mode;
-    uint8_t reserved_thread0;
+    uint8_t linux_compat;
     uint32_t pid;
     uint32_t ppid;
     uint32_t uid;
@@ -141,6 +191,8 @@ typedef struct {
     uint32_t wait_notify_mask;
     uint32_t* wait_notify_out_ptr;
     uint64_t wait_notify_deadline;
+    uint8_t wait_vfork;
+    uint8_t wait_reserved0[7];
     char cwd[MYAOS_PATH_MAX];
     process_entry_t entry;
     int argc;
@@ -162,8 +214,13 @@ typedef struct {
     uint64_t user_region_base;
     uint64_t user_region_end;
     uint64_t user_mmap_next;
+    uint64_t user_fs_base;
+    uint64_t linux_brk_base;
+    uint64_t linux_brk_current;
+    uint64_t linux_brk_limit;
     user_map_t user_maps[SCHED_MAX_USER_MAPS];
     proc_pipe_handle_t pipe_handles[SCHED_MAX_PIPE_HANDLES];
+    proc_file_handle_t file_handles[SCHED_MAX_FILE_HANDLES];
     uint8_t stdout_redirect;
     uint8_t stdout_append;
     uint8_t stdout_truncated;
@@ -195,6 +252,12 @@ static inline uint64_t read_rflags(void) {
     uint64_t rflags;
     __asm__ __volatile__("pushfq; popq %0" : "=r"(rflags));
     return rflags;
+}
+
+static inline void write_msr(uint32_t msr, uint64_t value) {
+    uint32_t lo = (uint32_t)(value & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(value >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
 }
 
 static uint64_t align_up(uint64_t value, uint64_t align) {
@@ -289,6 +352,32 @@ static void basename_copy(char* dst, const char* path, size_t dst_size) {
     }
 
     str_copy(dst, last[0] ? last : "proc", dst_size);
+}
+
+static int load_linux_interpreter_image(const char* interp_path, elf_image_t* out) {
+    char fallback[MYAOS_PATH_MAX];
+    size_t pos;
+
+    if (!interp_path || !interp_path[0] || !out) {
+        return -1;
+    }
+    if (elf_load_from_vfs("/", interp_path, out) == 0) {
+        return 0;
+    }
+    if (!str_starts_with(interp_path, "/")) {
+        return -1;
+    }
+
+    str_copy(fallback, "/boot", sizeof(fallback));
+    pos = str_len(fallback);
+    for (size_t i = 0u; interp_path[i] && pos + 1u < sizeof(fallback); i++) {
+        fallback[pos++] = interp_path[i];
+    }
+    fallback[pos] = '\0';
+    if (fallback[0] == '\0') {
+        return -1;
+    }
+    return elf_load_from_vfs("/", fallback, out);
 }
 
 static int find_user_slot_by_name(const char* name) {
@@ -546,6 +635,152 @@ static proc_pipe_handle_t* proc_pipe_handle_for_fd(sched_proc_t* proc, int32_t f
     return handle;
 }
 
+static int alloc_proc_file_handle(sched_proc_t* proc) {
+    if (!proc) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < SCHED_MAX_FILE_HANDLES; i++) {
+        if (!proc->file_handles[i].used) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int ensure_file_capacity(proc_file_handle_t* handle, uint32_t need) {
+    uint32_t new_capacity;
+    uint8_t* new_data;
+
+    if (!handle) {
+        return -1;
+    }
+    if (need <= handle->capacity) {
+        return 0;
+    }
+    if (need > SCHED_POSIX_FILE_MAX) {
+        return -1;
+    }
+
+    new_capacity = handle->capacity ? handle->capacity : 256u;
+    while (new_capacity < need) {
+        if (new_capacity >= SCHED_POSIX_FILE_MAX / 2u) {
+            new_capacity = SCHED_POSIX_FILE_MAX;
+            break;
+        }
+        new_capacity *= 2u;
+    }
+    if (new_capacity < need) {
+        return -1;
+    }
+
+    new_data = (uint8_t*)kmalloc(new_capacity ? new_capacity : 1u);
+    if (!new_data) {
+        return -1;
+    }
+    if (handle->data && handle->size > 0u) {
+        mem_copy(new_data, handle->data, handle->size);
+    }
+    if (handle->data) {
+        kfree(handle->data);
+    }
+    handle->data = new_data;
+    handle->capacity = new_capacity;
+    return 0;
+}
+
+static int clone_proc_file_handle(proc_file_handle_t* dst, const proc_file_handle_t* src) {
+    if (!dst || !src) {
+        return -1;
+    }
+    mem_zero(dst, sizeof(*dst));
+    if (!src->used) {
+        return 0;
+    }
+
+    dst->used = src->used;
+    dst->readable = src->readable;
+    dst->writable = src->writable;
+    dst->append = src->append;
+    dst->dirty = src->dirty;
+    dst->size = src->size;
+    dst->capacity = src->capacity;
+    dst->offset = src->offset;
+    str_copy(dst->abs_path, src->abs_path, sizeof(dst->abs_path));
+
+    if (dst->capacity > 0u) {
+        dst->data = (uint8_t*)kmalloc(dst->capacity);
+        if (!dst->data) {
+            mem_zero(dst, sizeof(*dst));
+            return -1;
+        }
+        if (src->size > 0u && src->data) {
+            mem_copy(dst->data, src->data, src->size);
+        }
+    }
+    return 0;
+}
+
+static int close_proc_file_handle(sched_proc_t* proc, int fd) {
+    uint32_t slot;
+    proc_file_handle_t* handle;
+    int rc = 0;
+
+    if (!proc || fd <= 0 || fd > (int)SCHED_MAX_FILE_HANDLES) {
+        return -1;
+    }
+    slot = (uint32_t)(fd - 1);
+    handle = &proc->file_handles[slot];
+    if (!handle->used) {
+        return -1;
+    }
+
+    if (handle->dirty && handle->writable) {
+        rc = vfs_write_file("/", handle->abs_path, handle->data, handle->size);
+    }
+    if (handle->data) {
+        kfree(handle->data);
+    }
+    mem_zero(handle, sizeof(*handle));
+    return rc;
+}
+
+static void close_all_proc_file_handles(sched_proc_t* proc) {
+    if (!proc) {
+        return;
+    }
+    for (uint32_t i = 0; i < SCHED_MAX_FILE_HANDLES; i++) {
+        if (proc->file_handles[i].used) {
+            (void)close_proc_file_handle(proc, (int)i + 1);
+        }
+    }
+}
+
+static proc_file_handle_t* proc_file_handle_for_fd(sched_proc_t* proc, int32_t fd, uint8_t required_mode) {
+    uint32_t slot;
+    proc_file_handle_t* handle;
+    uint8_t mode = 0u;
+
+    if (!proc || fd <= 0 || fd > (int32_t)SCHED_MAX_FILE_HANDLES) {
+        return NULL;
+    }
+    slot = (uint32_t)(fd - 1);
+    handle = &proc->file_handles[slot];
+    if (!handle->used) {
+        return NULL;
+    }
+
+    if (handle->readable) {
+        mode |= FILE_MODE_READ;
+    }
+    if (handle->writable) {
+        mode |= FILE_MODE_WRITE;
+    }
+    if ((mode & required_mode) != required_mode) {
+        return NULL;
+    }
+    return handle;
+}
+
 static int slot_is_runnable(uint32_t slot) {
     return slot < SCHED_MAX_PROCS && g_procs[slot].used && g_procs[slot].state == MYAOS_PROC_READY;
 }
@@ -621,6 +856,15 @@ static uint32_t first_ready_slot(void) {
     return find_next_ready(SCHED_MAX_PROCS - 1u);
 }
 
+static void load_proc_fs_base(const sched_proc_t* proc) {
+    uint64_t fs_base = 0u;
+
+    if (proc && proc->used && proc->user_mode && proc->linux_compat) {
+        fs_base = proc->user_fs_base;
+    }
+    write_msr(IA32_FS_BASE_MSR, fs_base);
+}
+
 static void clear_user_meta(sched_proc_t* proc) {
     if (!proc) {
         return;
@@ -642,6 +886,10 @@ static void clear_user_meta(sched_proc_t* proc) {
     proc->user_region_base = 0u;
     proc->user_region_end = 0u;
     proc->user_mmap_next = 0u;
+    proc->user_fs_base = 0u;
+    proc->linux_brk_base = 0u;
+    proc->linux_brk_current = 0u;
+    proc->linux_brk_limit = 0u;
     mem_zero(proc->user_maps, sizeof(proc->user_maps));
 }
 
@@ -679,6 +927,9 @@ static void free_user_space(sched_proc_t* proc) {
     if (proc->user_stack_size) {
         paging_free_user_range(proc->user_stack_base, proc->user_stack_size);
     }
+    if (proc->linux_brk_limit > proc->linux_brk_base) {
+        paging_free_user_range(proc->linux_brk_base, proc->linux_brk_limit - proc->linux_brk_base);
+    }
     if (proc->user_trampoline) {
         paging_free_user_range(proc->user_trampoline, PAGE_SIZE);
     }
@@ -687,6 +938,173 @@ static void free_user_space(sched_proc_t* proc) {
 
 clear_meta:
     clear_user_meta(proc);
+}
+
+static int clone_user_range_between_spaces(
+    uint64_t src_cr3,
+    uint64_t dst_cr3,
+    uint64_t base,
+    uint64_t size,
+    uint8_t writable,
+    uint8_t* scratch_page
+) {
+    uint64_t start;
+    uint64_t end;
+
+    if (size == 0u) {
+        return 0;
+    }
+    if (base == 0u || !scratch_page || base + size < base) {
+        return -1;
+    }
+
+    start = base & ~(PAGE_SIZE - 1ULL);
+    end = align_up(base + size, PAGE_SIZE);
+    if (end <= start) {
+        return -1;
+    }
+
+    if (paging_switch_to(src_cr3) != 0) {
+        return -1;
+    }
+    if (!paging_user_range_accessible(start, end - start, 0u)) {
+        return -1;
+    }
+    if (paging_switch_to(dst_cr3) != 0) {
+        return -1;
+    }
+    if (paging_alloc_user_range(start, end - start, writable ? 1u : 0u) != 0) {
+        return -1;
+    }
+
+    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+        if (paging_switch_to(src_cr3) != 0) {
+            return -1;
+        }
+        mem_copy(scratch_page, (const void*)(uintptr_t)addr, PAGE_SIZE);
+        if (paging_switch_to(dst_cr3) != 0) {
+            return -1;
+        }
+        mem_copy((void*)(uintptr_t)addr, scratch_page, PAGE_SIZE);
+    }
+
+    return 0;
+}
+
+static int clone_process_user_space(const sched_proc_t* parent, sched_proc_t* child) {
+    uint64_t prev_cr3;
+    uint64_t child_cr3 = 0u;
+    uint8_t* scratch_page = NULL;
+    uint64_t brk_size = 0u;
+    int rc = -1;
+
+    if (!parent || !child || parent->page_table_cr3 == 0u || parent->page_table_cr3 == paging_kernel_cr3()) {
+        return -1;
+    }
+
+    prev_cr3 = paging_current_cr3();
+    scratch_page = (uint8_t*)kmalloc(PAGE_SIZE);
+    if (!scratch_page) {
+        return -1;
+    }
+
+    if (paging_space_create(&child_cr3) != 0) {
+        goto done;
+    }
+
+    if (clone_user_range_between_spaces(
+            parent->page_table_cr3,
+            child_cr3,
+            parent->user_image_base,
+            parent->user_image_size,
+            1u,
+            scratch_page
+        ) != 0) {
+        goto done;
+    }
+    if (clone_user_range_between_spaces(
+            parent->page_table_cr3,
+            child_cr3,
+            parent->user_trampoline,
+            PAGE_SIZE,
+            1u,
+            scratch_page
+        ) != 0) {
+        goto done;
+    }
+    if (clone_user_range_between_spaces(
+            parent->page_table_cr3,
+            child_cr3,
+            parent->user_argv_base,
+            parent->user_argv_size,
+            1u,
+            scratch_page
+        ) != 0) {
+        goto done;
+    }
+    if (clone_user_range_between_spaces(
+            parent->page_table_cr3,
+            child_cr3,
+            parent->user_stack_base,
+            parent->user_stack_size,
+            1u,
+            scratch_page
+        ) != 0) {
+        goto done;
+    }
+
+    if (parent->linux_brk_limit > parent->linux_brk_base) {
+        brk_size = parent->linux_brk_limit - parent->linux_brk_base;
+    }
+    if (clone_user_range_between_spaces(
+            parent->page_table_cr3,
+            child_cr3,
+            parent->linux_brk_base,
+            brk_size,
+            1u,
+            scratch_page
+        ) != 0) {
+        goto done;
+    }
+
+    for (uint32_t i = 0u; i < SCHED_MAX_USER_MAPS; i++) {
+        const user_map_t* map = &parent->user_maps[i];
+        if (!map->used || map->size == 0u) {
+            continue;
+        }
+        if (user_map_is_swapped(map)) {
+            goto done;
+        }
+        if (clone_user_range_between_spaces(
+                parent->page_table_cr3,
+                child_cr3,
+                map->base,
+                map->size,
+                /* We need writable pages during bootstrap copy; effective
+                   per-map permissions are tracked in user_map metadata and
+                   can be tightened later with real mprotect support. */
+                1u,
+                scratch_page
+            ) != 0) {
+            goto done;
+        }
+    }
+
+    child->page_table_cr3 = child_cr3;
+    child_cr3 = 0u;
+    rc = 0;
+
+done:
+    if (paging_switch_to(prev_cr3) != 0) {
+        rc = -1;
+    }
+    if (child_cr3 != 0u) {
+        paging_space_destroy(child_cr3);
+    }
+    if (scratch_page) {
+        kfree(scratch_page);
+    }
+    return rc;
 }
 
 static uint64_t make_initial_context(uint32_t slot) {
@@ -714,6 +1132,9 @@ static uint64_t make_initial_context(uint32_t slot) {
         frame->ss = g_user_ss;
         if (proc->thread_mode) {
             frame->rdi = proc->thread_arg;
+            frame->rsi = 0u;
+        } else if (proc->linux_compat) {
+            frame->rdi = 0u;
             frame->rsi = 0u;
         } else {
             frame->rdi = (uint64_t)(uint32_t)proc->argc;
@@ -799,14 +1220,144 @@ static int build_user_argv(sched_proc_t* proc) {
     return 0;
 }
 
-static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf_image_t* image) {
+typedef struct {
+    uint64_t at_phdr;
+    uint64_t at_phent;
+    uint64_t at_phnum;
+    uint64_t at_base;
+    uint64_t at_entry;
+    uint64_t at_execfn_ptr;
+    uint64_t at_random_ptr;
+    uint64_t at_clktck;
+} linux_stack_aux_t;
+
+static int build_user_linux_stack(sched_proc_t* proc, uint64_t stack_top, const linux_stack_aux_t* aux) {
+    uint64_t arg_ptrs[SCHED_LINUX_ARGV_MAX];
+    uint64_t cursor;
+    uint64_t stack_min;
+    uint64_t random_pos;
+    uint64_t execfn_ptr;
+    uint64_t seed;
+    int argc;
+
+    if (!proc || !aux || proc->argc < 0 || (uint32_t)proc->argc > SCHED_LINUX_ARGV_MAX) {
+        return -1;
+    }
+
+    argc = proc->argc;
+    cursor = stack_top;
+    stack_min = proc->user_stack_base;
+
+    for (int i = argc - 1; i >= 0; i--) {
+        const char* arg = (proc->argv && proc->argv[i]) ? proc->argv[i] : "";
+        uint64_t len = str_len(arg) + 1u;
+        if (cursor < stack_min + len) {
+            return -1;
+        }
+        cursor -= len;
+        mem_copy((void*)(uintptr_t)cursor, arg, (size_t)len);
+        arg_ptrs[i] = cursor;
+    }
+
+    if (cursor < stack_min + 16u) {
+        return -1;
+    }
+    cursor -= 16u;
+    random_pos = cursor;
+    seed = timer_ticks() ^ ((uint64_t)proc->pid << 32);
+    for (uint32_t i = 0u; i < 16u; i++) {
+        seed = seed * 6364136223846793005ull + 1ull;
+        ((uint8_t*)(uintptr_t)random_pos)[i] = (uint8_t)(seed >> 40);
+    }
+
+    cursor &= ~0xFULL;
+    execfn_ptr = aux->at_execfn_ptr;
+    if (execfn_ptr == 0u && argc > 0) {
+        execfn_ptr = arg_ptrs[0];
+    }
+
+#define LINUX_STACK_PUSH(value_expr)                       \
+    do {                                                   \
+        if (cursor < stack_min + sizeof(uint64_t)) {      \
+            return -1;                                     \
+        }                                                  \
+        cursor -= sizeof(uint64_t);                        \
+        *((uint64_t*)(uintptr_t)cursor) = (value_expr);    \
+    } while (0)
+
+    /* Rich auxv for Linux userspace startup/runtime. */
+    LINUX_STACK_PUSH(0u);
+    LINUX_STACK_PUSH(LINUX_AT_NULL);
+    LINUX_STACK_PUSH(execfn_ptr);
+    LINUX_STACK_PUSH(LINUX_AT_EXECFN);
+    LINUX_STACK_PUSH(aux->at_random_ptr ? aux->at_random_ptr : random_pos);
+    LINUX_STACK_PUSH(LINUX_AT_RANDOM);
+    LINUX_STACK_PUSH(0u);
+    LINUX_STACK_PUSH(LINUX_AT_SECURE);
+    LINUX_STACK_PUSH(aux->at_clktck);
+    LINUX_STACK_PUSH(LINUX_AT_CLKTCK);
+    LINUX_STACK_PUSH(0u);
+    LINUX_STACK_PUSH(LINUX_AT_EGID);
+    LINUX_STACK_PUSH(0u);
+    LINUX_STACK_PUSH(LINUX_AT_GID);
+    LINUX_STACK_PUSH((uint64_t)proc->uid);
+    LINUX_STACK_PUSH(LINUX_AT_EUID);
+    LINUX_STACK_PUSH((uint64_t)proc->uid);
+    LINUX_STACK_PUSH(LINUX_AT_UID);
+    LINUX_STACK_PUSH(aux->at_entry);
+    LINUX_STACK_PUSH(LINUX_AT_ENTRY);
+    LINUX_STACK_PUSH(0u);
+    LINUX_STACK_PUSH(LINUX_AT_FLAGS);
+    LINUX_STACK_PUSH(aux->at_base);
+    LINUX_STACK_PUSH(LINUX_AT_BASE);
+    LINUX_STACK_PUSH(PAGE_SIZE);
+    LINUX_STACK_PUSH(LINUX_AT_PAGESZ);
+    LINUX_STACK_PUSH(aux->at_phnum);
+    LINUX_STACK_PUSH(LINUX_AT_PHNUM);
+    LINUX_STACK_PUSH(aux->at_phent);
+    LINUX_STACK_PUSH(LINUX_AT_PHENT);
+    LINUX_STACK_PUSH(aux->at_phdr);
+    LINUX_STACK_PUSH(LINUX_AT_PHDR);
+
+    /* envp[] = { NULL } */
+    LINUX_STACK_PUSH(0u);
+
+    /* argv[argc] = NULL */
+    LINUX_STACK_PUSH(0u);
+    for (int i = argc - 1; i >= 0; i--) {
+        LINUX_STACK_PUSH(arg_ptrs[i]);
+    }
+
+    proc->user_argv_ptr = cursor;
+    LINUX_STACK_PUSH((uint64_t)(uint32_t)argc);
+
+#undef LINUX_STACK_PUSH
+
+    proc->user_rsp = cursor;
+    return 0;
+}
+
+static int setup_user_process_image(
+    sched_proc_t* proc,
+    uint32_t slot,
+    const elf_image_t* image,
+    const elf_image_t* interp_image
+) {
     uint64_t base;
     uint64_t image_offset;
-    uint64_t image_size;
-    uint64_t entry_delta;
+    uint64_t main_size;
+    uint64_t total_image_size;
+    uint64_t interp_offset = 0u;
+    uint64_t interp_size = 0u;
+    uint64_t main_entry_off;
+    uint64_t main_entry;
+    uint64_t interp_entry = 0u;
+    uint64_t phdr_off = 0u;
+    uint64_t linux_clktck = 100u;
     uint64_t stack_top;
-    uint64_t initial_rsp;
     uint64_t prev_cr3;
+    uint8_t has_interp = 0u;
+    linux_stack_aux_t aux;
     uint8_t trampoline[11] = {
         0x89, 0xC7,
         0xB8, 0x00, 0x00, 0x00, 0x00,
@@ -818,13 +1369,29 @@ static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf
         return -1;
     }
 
+    if (proc->linux_compat && interp_image && interp_image->load_base && interp_image->load_size > 0u) {
+        has_interp = 1u;
+    }
+
     base = slot_user_region_base(slot);
     image_offset = USER_IMAGE_BASE_OFFSET;
-    image_size = align_up(image->load_size, PAGE_SIZE);
-    if (image_size == 0) {
+    main_size = align_up(image->load_size, PAGE_SIZE);
+    if (main_size == 0) {
         return -1;
     }
-    if (image_offset + image_size >= USER_ARGV_BASE_OFFSET) {
+    total_image_size = main_size;
+    if (has_interp) {
+        interp_size = align_up(interp_image->load_size, PAGE_SIZE);
+        if (interp_size == 0u) {
+            return -1;
+        }
+        interp_offset = align_up(image_offset + main_size + PAGE_SIZE, PAGE_SIZE);
+        if (interp_offset < image_offset || interp_offset + interp_size < interp_offset) {
+            return -1;
+        }
+        total_image_size = (interp_offset - image_offset) + interp_size;
+    }
+    if (image_offset + total_image_size >= USER_ARGV_BASE_OFFSET) {
         return -1;
     }
     if (proc->page_table_cr3 == 0u) {
@@ -834,16 +1401,26 @@ static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf
     proc->user_mode = 1;
     proc->thread_mode = 0u;
     proc->user_image_base = base + image_offset;
-    proc->user_image_size = image_size;
+    proc->user_image_size = total_image_size;
     proc->user_trampoline = base + USER_TRAMPOLINE_OFFSET;
-    proc->user_argv_base = base + USER_ARGV_BASE_OFFSET;
-    proc->user_argv_size = USER_ARGV_SIZE;
+    if (proc->linux_compat) {
+        proc->user_argv_base = 0u;
+        proc->user_argv_size = 0u;
+    } else {
+        proc->user_argv_base = base + USER_ARGV_BASE_OFFSET;
+        proc->user_argv_size = USER_ARGV_SIZE;
+    }
     proc->user_stack_base = base + USER_STACK_TOP_OFFSET - USER_STACK_SIZE;
     proc->user_stack_size = USER_STACK_SIZE;
     proc->user_region_base = base;
     proc->user_region_end = base + USER_REGION_STRIDE;
     proc->user_mmap_next = base + USER_MMAP_MIN_OFFSET;
+    proc->user_fs_base = 0u;
+    proc->linux_brk_base = align_up(proc->user_image_base + total_image_size, PAGE_SIZE);
+    proc->linux_brk_current = proc->linux_brk_base;
+    proc->linux_brk_limit = proc->linux_brk_base;
     mem_zero(proc->user_maps, sizeof(proc->user_maps));
+    mem_zero(&aux, sizeof(aux));
 
     prev_cr3 = paging_current_cr3();
     if (paging_switch_to(proc->page_table_cr3) != 0) {
@@ -857,6 +1434,10 @@ static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf
         return -1;
     }
     mem_copy((void*)(uintptr_t)proc->user_image_base, image->load_base, (size_t)image->load_size);
+    if (has_interp) {
+        uint64_t interp_base = base + interp_offset;
+        mem_copy((void*)(uintptr_t)interp_base, interp_image->load_base, (size_t)interp_image->load_size);
+    }
 
     if (paging_alloc_user_range(proc->user_trampoline, PAGE_SIZE, 1u) != 0) {
         (void)paging_switch_to(prev_cr3);
@@ -869,15 +1450,17 @@ static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf
     trampoline[6] = (uint8_t)((MYAOS_SYS_PROC_EXIT >> 24) & 0xFFu);
     mem_copy((void*)(uintptr_t)proc->user_trampoline, trampoline, sizeof(trampoline));
 
-    if (paging_alloc_user_range(proc->user_argv_base, proc->user_argv_size, 1u) != 0) {
-        (void)paging_switch_to(prev_cr3);
-        free_user_space(proc);
-        return -1;
-    }
-    if (build_user_argv(proc) != 0) {
-        (void)paging_switch_to(prev_cr3);
-        free_user_space(proc);
-        return -1;
+    if (!proc->linux_compat) {
+        if (paging_alloc_user_range(proc->user_argv_base, proc->user_argv_size, 1u) != 0) {
+            (void)paging_switch_to(prev_cr3);
+            free_user_space(proc);
+            return -1;
+        }
+        if (build_user_argv(proc) != 0) {
+            (void)paging_switch_to(prev_cr3);
+            free_user_space(proc);
+            return -1;
+        }
     }
 
     if (paging_alloc_user_range(proc->user_stack_base, proc->user_stack_size, 1u) != 0) {
@@ -886,19 +1469,66 @@ static int setup_user_process_image(sched_proc_t* proc, uint32_t slot, const elf
         return -1;
     }
 
-    entry_delta = (uint64_t)(uintptr_t)image->entry - (uint64_t)(uintptr_t)image->load_base;
-    if (entry_delta >= image->load_size) {
+    if (image->entry_vaddr < image->vaddr_base) {
         (void)paging_switch_to(prev_cr3);
         free_user_space(proc);
         return -1;
     }
+    main_entry_off = image->entry_vaddr - image->vaddr_base;
+    if (main_entry_off >= image->load_size) {
+        (void)paging_switch_to(prev_cr3);
+        free_user_space(proc);
+        return -1;
+    }
+    main_entry = proc->user_image_base + main_entry_off;
 
-    proc->user_entry = proc->user_image_base + entry_delta;
+    if (has_interp) {
+        uint64_t interp_base = base + interp_offset;
+        uint64_t interp_entry_off;
+
+        if (interp_image->entry_vaddr < interp_image->vaddr_base) {
+            (void)paging_switch_to(prev_cr3);
+            free_user_space(proc);
+            return -1;
+        }
+        interp_entry_off = interp_image->entry_vaddr - interp_image->vaddr_base;
+        if (interp_entry_off >= interp_image->load_size) {
+            (void)paging_switch_to(prev_cr3);
+            free_user_space(proc);
+            return -1;
+        }
+        interp_entry = interp_base + interp_entry_off;
+    }
+
+    proc->user_entry = has_interp ? interp_entry : main_entry;
+
+    if (image->phdr_vaddr >= image->vaddr_base) {
+        phdr_off = image->phdr_vaddr - image->vaddr_base;
+        if (phdr_off < image->load_size) {
+            aux.at_phdr = proc->user_image_base + phdr_off;
+        }
+    }
+    aux.at_phent = image->phentsize;
+    aux.at_phnum = image->phnum;
+    aux.at_base = has_interp ? (base + interp_offset) : 0u;
+    aux.at_entry = main_entry;
+    aux.at_execfn_ptr = 0u;
+    aux.at_random_ptr = 0u;
+    linux_clktck = timer_hz();
+    aux.at_clktck = (linux_clktck == 0u) ? 100u : linux_clktck;
 
     stack_top = base + USER_STACK_TOP_OFFSET;
-    initial_rsp = stack_top - sizeof(uint64_t);
-    *((uint64_t*)(uintptr_t)initial_rsp) = proc->user_trampoline;
-    proc->user_rsp = initial_rsp;
+    if (proc->linux_compat) {
+        if (build_user_linux_stack(proc, stack_top, &aux) != 0) {
+            (void)paging_switch_to(prev_cr3);
+            free_user_space(proc);
+            return -1;
+        }
+    } else {
+        uint64_t initial_rsp = stack_top - sizeof(uint64_t);
+        *((uint64_t*)(uintptr_t)initial_rsp) = proc->user_trampoline;
+        proc->user_rsp = initial_rsp;
+    }
     (void)paging_switch_to(prev_cr3);
     return 0;
 }
@@ -940,6 +1570,7 @@ static void release_proc_slot(sched_proc_t* proc) {
 
     proc_cr3 = proc->page_table_cr3;
     close_all_proc_pipe_handles(proc);
+    close_all_proc_file_handles(proc);
     free_proc_resources(proc);
     if (proc_cr3 != 0u && proc_cr3 != paging_kernel_cr3() && count_procs_with_cr3(proc_cr3) <= 1u) {
         destroy_space = 1u;
@@ -961,7 +1592,7 @@ static void release_proc_slot(sched_proc_t* proc) {
     proc->thread_group = 0;
     proc->thread_arg = 0;
     proc->thread_mode = 0;
-    proc->reserved_thread0 = 0;
+    proc->linux_compat = 0;
     proc->name[0] = '\0';
     proc->state = MYAOS_PROC_NONE;
     proc->background = 0;
@@ -983,6 +1614,7 @@ static void release_proc_slot(sched_proc_t* proc) {
     proc->wait_notify_mask = 0u;
     proc->wait_notify_out_ptr = NULL;
     proc->wait_notify_deadline = 0u;
+    proc->wait_vfork = 0u;
     proc->cwd[0] = '\0';
     proc->entry = NULL;
     proc->kernel_stack_top = 0;
@@ -991,6 +1623,7 @@ static void release_proc_slot(sched_proc_t* proc) {
     proc->user_region_end = 0;
     clear_user_meta(proc);
     mem_zero(proc->pipe_handles, sizeof(proc->pipe_handles));
+    mem_zero(proc->file_handles, sizeof(proc->file_handles));
     proc->stdout_redirect = 0;
     proc->stdout_append = 0;
     proc->stdout_truncated = 0;
@@ -1032,7 +1665,7 @@ static int init_proc_common(
     proc->ppid = ppid;
     proc->uid = parent ? parent->uid : 0u;
     proc->thread_mode = 0u;
-    proc->reserved_thread0 = 0u;
+    proc->linux_compat = 0u;
     proc->thread_group = proc->pid;
     proc->thread_arg = 0u;
     str_copy(proc->name, name ? name : "proc", sizeof(proc->name));
@@ -1052,6 +1685,7 @@ static int init_proc_common(
     proc->wait_notify_mask = 0u;
     proc->wait_notify_out_ptr = NULL;
     proc->wait_notify_deadline = 0u;
+    proc->wait_vfork = 0u;
     proc->page_table_cr3 = paging_kernel_cr3();
     proc->user_region_base = 0u;
     proc->user_region_end = 0u;
@@ -1087,11 +1721,24 @@ static int init_proc_common(
                 g_pipes[pipe_slot].writers++;
             }
         }
+
+        for (uint32_t i = 0; i < SCHED_MAX_FILE_HANDLES; i++) {
+            if (!parent->file_handles[i].used) {
+                continue;
+            }
+            if (clone_proc_file_handle(&proc->file_handles[i], &parent->file_handles[i]) != 0) {
+                close_all_proc_pipe_handles(proc);
+                close_all_proc_file_handles(proc);
+                proc->used = 0;
+                return -1;
+            }
+        }
     }
 
     proc->kernel_stack_raw = kmalloc(SCHED_STACK_SIZE + 16u);
     if (!proc->kernel_stack_raw) {
         close_all_proc_pipe_handles(proc);
+        close_all_proc_file_handles(proc);
         proc->used = 0;
         return -1;
     }
@@ -1103,6 +1750,7 @@ static int init_proc_common(
         proc->kernel_stack_raw = NULL;
         proc->kernel_stack_top = 0;
         close_all_proc_pipe_handles(proc);
+        close_all_proc_file_handles(proc);
         proc->used = 0;
         return -1;
     }
@@ -1138,6 +1786,7 @@ static void wake_sleepers(uint64_t tick_now) {
             proc->wait_notify_out_ptr = NULL;
             proc->wait_notify_deadline = 0u;
             proc->wait_pid = -1;
+            proc->wait_vfork = 0u;
             proc->state = MYAOS_PROC_READY;
         }
     }
@@ -1171,6 +1820,7 @@ static void maybe_wake_notify_waiter(sched_proc_t* proc) {
     proc->wait_notify_out_ptr = NULL;
     proc->wait_notify_deadline = 0u;
     proc->wait_pid = -1;
+    proc->wait_vfork = 0u;
     proc->state = MYAOS_PROC_READY;
 }
 
@@ -1193,7 +1843,37 @@ static void maybe_wake_waiters(uint32_t child_slot) {
         }
         proc->wait_exit_ptr = NULL;
         proc->wait_pid = -1;
+        proc->wait_vfork = 0u;
         proc->state = MYAOS_PROC_READY;
+    }
+}
+
+static void wake_vfork_parent(uint32_t parent_pid, uint32_t child_pid) {
+    if (parent_pid == 0u || child_pid == 0u) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < SCHED_MAX_PROCS; i++) {
+        sched_proc_t* parent = &g_procs[i];
+        if (!parent->used || parent->pid != parent_pid) {
+            continue;
+        }
+        if (!parent->wait_vfork || parent->wait_pid != (int32_t)child_pid) {
+            break;
+        }
+        parent->wait_vfork = 0u;
+        parent->wait_pid = -1;
+        parent->wait_exit_ptr = NULL;
+        parent->wait_notify_active = 0u;
+        parent->wait_notify_clear = 0u;
+        parent->wait_notify_reserved0 = 0u;
+        parent->wait_notify_mask = 0u;
+        parent->wait_notify_out_ptr = NULL;
+        parent->wait_notify_deadline = 0u;
+        if (parent->state == MYAOS_PROC_BLOCKED) {
+            parent->state = MYAOS_PROC_READY;
+        }
+        break;
     }
 }
 
@@ -1231,6 +1911,8 @@ static uint64_t schedule_switch(uint64_t current_rsp, uint64_t tick_now, uint8_t
             current->wait_notify_mask = 0u;
             current->wait_notify_out_ptr = NULL;
             current->wait_notify_deadline = 0u;
+            current->wait_vfork = 0u;
+            wake_vfork_parent(current->ppid, current->pid);
             maybe_wake_waiters(g_current_slot);
             g_resched_mode = RESCHED_DROP;
         }
@@ -1266,6 +1948,7 @@ static uint64_t schedule_switch(uint64_t current_rsp, uint64_t tick_now, uint8_t
             g_resched_mode = RESCHED_NONE;
             gdt_set_kernel_stack(current->kernel_stack_top);
             (void)paging_switch_to(current->page_table_cr3);
+            load_proc_fs_base(current);
             return current->saved_rsp ? current->saved_rsp : current_rsp;
         }
         g_resched_mode = RESCHED_NONE;
@@ -1283,6 +1966,7 @@ static uint64_t schedule_switch(uint64_t current_rsp, uint64_t tick_now, uint8_t
     g_resched_mode = RESCHED_NONE;
     gdt_set_kernel_stack(g_procs[next].kernel_stack_top);
     (void)paging_switch_to(g_procs[next].page_table_cr3);
+    load_proc_fs_base(&g_procs[next]);
     return g_procs[next].saved_rsp;
 }
 
@@ -1399,6 +2083,7 @@ static void apply_spawn_opts(sched_proc_t* proc, uint8_t background, const myaos
     proc->cpu_limit_ticks = 0u;
     proc->vm_limit_bytes = 0u;
     proc->cpu_ticks_used = 0u;
+    proc->linux_compat = 0u;
     proc->stdout_redirect = 0;
     proc->stdout_append = 0;
     proc->stdout_truncated = 0;
@@ -1410,6 +2095,9 @@ static void apply_spawn_opts(sched_proc_t* proc, uint8_t background, const myaos
 
     if ((opts->flags & MYAOS_SPAWN_BACKGROUND) != 0u) {
         proc->background = 1;
+    }
+    if ((opts->flags & MYAOS_SPAWN_LINUX) != 0u) {
+        proc->linux_compat = 1u;
     }
     if (opts->priority != 0u) {
         proc->priority = sanitize_priority(opts->priority);
@@ -1436,12 +2124,16 @@ int scheduler_spawn_program_ex(
 ) {
     int slot = alloc_proc_slot();
     elf_image_t image;
+    elf_image_t interp_image;
+    uint8_t use_interp = 0u;
     char name[SCHED_PROC_NAME_MAX];
     char fallback_path[MYAOS_PATH_MAX];
     const char* load_path = path;
     uint32_t ppid = current_proc() ? current_proc()->pid : 0;
     const char* proc_cwd = cwd && cwd[0] ? cwd : scheduler_current_cwd();
     uint8_t background = (opts && (opts->flags & MYAOS_SPAWN_BACKGROUND) != 0u) ? 1u : 0u;
+
+    mem_zero(&interp_image, sizeof(interp_image));
 
     if (slot < 0) {
         return -1;
@@ -1471,15 +2163,29 @@ int scheduler_spawn_program_ex(
         return -1;
     }
     apply_spawn_opts(&g_procs[slot], background, opts);
+    if (g_procs[slot].linux_compat && image.interp[0]) {
+        if (load_linux_interpreter_image(image.interp, &interp_image) != 0) {
+            release_proc_slot(&g_procs[slot]);
+            elf_unload(&image);
+            return -1;
+        }
+        use_interp = 1u;
+    }
     if (paging_space_create(&g_procs[slot].page_table_cr3) != 0) {
         release_proc_slot(&g_procs[slot]);
         elf_unload(&image);
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         return -1;
     }
 
-    if (setup_user_process_image(&g_procs[slot], (uint32_t)slot, &image) != 0) {
+    if (setup_user_process_image(&g_procs[slot], (uint32_t)slot, &image, use_interp ? &interp_image : NULL) != 0) {
         release_proc_slot(&g_procs[slot]);
         elf_unload(&image);
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         return -1;
     }
 
@@ -1487,10 +2193,16 @@ int scheduler_spawn_program_ex(
     if (g_procs[slot].saved_rsp == 0) {
         release_proc_slot(&g_procs[slot]);
         elf_unload(&image);
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         return -1;
     }
 
     elf_unload(&image);
+    if (use_interp) {
+        elf_unload(&interp_image);
+    }
     if (out_pid) {
         *out_pid = (int32_t)g_procs[slot].pid;
     }
@@ -1518,10 +2230,16 @@ int scheduler_spawn_program(
 int scheduler_exec_current(const char* path, int argc, const char* const* argv) {
     sched_proc_t* proc = current_proc();
     elf_image_t image;
+    elf_image_t interp_image;
+    uint8_t use_interp = 0u;
     char** argv_copy = NULL;
     void* argv_block = NULL;
+    char exec_path[MYAOS_PATH_MAX];
+    uint32_t exec_len = 0u;
     uint64_t new_cr3 = 0;
     uint8_t needs_new_space;
+
+    mem_zero(&interp_image, sizeof(interp_image));
 
     if (!proc) {
         return -1;
@@ -1529,20 +2247,48 @@ int scheduler_exec_current(const char* path, int argc, const char* const* argv) 
     if (proc->thread_mode) {
         return -1;
     }
-    if (vfs_can_exec(proc->cwd, path) != 0) {
+    if (!path) {
         return -1;
     }
-    if (elf_load_from_vfs(proc->cwd, path, &image) != 0) {
+    while (exec_len + 1u < (uint32_t)sizeof(exec_path) && path[exec_len] != '\0') {
+        exec_path[exec_len] = path[exec_len];
+        exec_len++;
+    }
+    if (path[exec_len] != '\0') {
         return -1;
+    }
+    exec_path[exec_len] = '\0';
+
+    if (vfs_can_exec(proc->cwd, exec_path) != 0) {
+        return -1;
+    }
+    if (elf_load_from_vfs(proc->cwd, exec_path, &image) != 0) {
+        return -1;
+    }
+    if (proc->linux_compat && image.interp[0]) {
+        if (load_linux_interpreter_image(image.interp, &interp_image) != 0) {
+            elf_unload(&image);
+            return -1;
+        }
+        use_interp = 1u;
     }
     if (duplicate_argv(argc, argv, &argv_copy, &argv_block) != 0) {
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         elf_unload(&image);
         return -1;
     }
 
-    needs_new_space = (uint8_t)(proc->page_table_cr3 == paging_kernel_cr3());
+    needs_new_space = (uint8_t)(
+        proc->page_table_cr3 == paging_kernel_cr3() ||
+        (proc->page_table_cr3 != 0u && count_procs_with_cr3(proc->page_table_cr3) > 1u)
+    );
     if (needs_new_space && paging_space_create(&new_cr3) != 0) {
         kfree(argv_block);
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         elf_unload(&image);
         return -1;
     }
@@ -1555,23 +2301,34 @@ int scheduler_exec_current(const char* path, int argc, const char* const* argv) 
     proc->argv = argv_copy;
     proc->argv_block = argv_block;
     proc->entry = NULL;
+    proc->linux_compat = proc->linux_compat ? 1u : 0u;
 
-    if (setup_user_process_image(proc, g_current_slot, &image) != 0) {
+    if (setup_user_process_image(proc, g_current_slot, &image, use_interp ? &interp_image : NULL) != 0) {
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         elf_unload(&image);
         scheduler_exit_current(-1);
         return -1;
     }
 
-    basename_copy(proc->name, path, sizeof(proc->name));
+    basename_copy(proc->name, exec_path, sizeof(proc->name));
     proc->state = MYAOS_PROC_READY;
     proc->saved_rsp = make_initial_context(g_current_slot);
     if (proc->saved_rsp == 0) {
+        if (use_interp) {
+            elf_unload(&interp_image);
+        }
         elf_unload(&image);
         scheduler_exit_current(-1);
         return -1;
     }
 
+    if (use_interp) {
+        elf_unload(&interp_image);
+    }
     elf_unload(&image);
+    wake_vfork_parent(proc->ppid, proc->pid);
     g_resched_mode = RESCHED_DROP;
     return 0;
 }
@@ -1607,6 +2364,7 @@ int scheduler_wait(int32_t pid, int32_t* exit_code) {
     proc->wait_notify_mask = 0u;
     proc->wait_notify_out_ptr = NULL;
     proc->wait_notify_deadline = 0u;
+    proc->wait_vfork = 0u;
     g_resched_mode = RESCHED_SAVE;
     return 0;
 }
@@ -1670,6 +2428,8 @@ int scheduler_kill_pid(int32_t pid, int32_t exit_code) {
     g_procs[slot].wait_notify_mask = 0u;
     g_procs[slot].wait_notify_out_ptr = NULL;
     g_procs[slot].wait_notify_deadline = 0u;
+    g_procs[slot].wait_vfork = 0u;
+    wake_vfork_parent(g_procs[slot].ppid, g_procs[slot].pid);
     maybe_wake_waiters((uint32_t)slot);
     return 0;
 }
@@ -1691,6 +2451,8 @@ void scheduler_exit_current(int32_t exit_code) {
     proc->wait_notify_mask = 0u;
     proc->wait_notify_out_ptr = NULL;
     proc->wait_notify_deadline = 0u;
+    proc->wait_vfork = 0u;
+    wake_vfork_parent(proc->ppid, proc->pid);
     maybe_wake_waiters(g_current_slot);
     g_resched_mode = RESCHED_DROP;
 }
@@ -1781,6 +2543,7 @@ void scheduler_run(void) {
     g_procs[first].last_run_tick = g_last_switch_tick;
     gdt_set_kernel_stack(g_procs[first].kernel_stack_top);
     (void)paging_switch_to(g_procs[first].page_table_cr3);
+    load_proc_fs_base(&g_procs[first]);
 
     scheduler_restore_and_enter(g_procs[first].saved_rsp);
 }
@@ -1844,6 +2607,21 @@ int scheduler_notify(int32_t pid, uint32_t bits) {
     return 0;
 }
 
+void scheduler_notify_all(uint32_t bits) {
+    if (bits == 0u) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < SCHED_MAX_PROCS; i++) {
+        sched_proc_t* proc = &g_procs[i];
+        if (!proc->used || proc->state == MYAOS_PROC_ZOMBIE) {
+            continue;
+        }
+        proc->notify_bits |= bits;
+        maybe_wake_notify_waiter(proc);
+    }
+}
+
 int scheduler_notify_poll(uint32_t mask, uint8_t clear, uint32_t* out_bits) {
     sched_proc_t* proc = current_proc();
     uint32_t effective_mask = mask ? mask : 0xFFFFFFFFu;
@@ -1903,6 +2681,7 @@ int scheduler_notify_wait(uint32_t mask, uint32_t timeout_ticks, uint8_t clear, 
     proc->wait_notify_mask = mask;
     proc->wait_notify_out_ptr = out_bits;
     proc->wait_notify_deadline = deadline;
+    proc->wait_vfork = 0u;
     proc->state = MYAOS_PROC_BLOCKED;
     g_resched_mode = RESCHED_SAVE;
     return 0;
@@ -2103,6 +2882,317 @@ int scheduler_pipe_write(int32_t fd, const void* data, uint32_t len, uint32_t* o
     return 0;
 }
 
+int scheduler_posix_open(const char* path, uint32_t flags, int32_t* out_fd) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* handle;
+    uint8_t* read_buf;
+    uint32_t read_size = 0u;
+    uint8_t acc_mode;
+    uint8_t create;
+    uint8_t trunc;
+    char abs_path[MYAOS_PATH_MAX];
+    int slot;
+
+    if (!proc || !path || !out_fd) {
+        return -1;
+    }
+
+    acc_mode = (uint8_t)(flags & MYAOS_POSIX_O_ACCMODE);
+    if (acc_mode > MYAOS_POSIX_O_RDWR) {
+        return -1;
+    }
+    create = (uint8_t)((flags & MYAOS_POSIX_O_CREAT) != 0u);
+    trunc = (uint8_t)((flags & MYAOS_POSIX_O_TRUNC) != 0u);
+    if (trunc && acc_mode == MYAOS_POSIX_O_RDONLY) {
+        return -1;
+    }
+
+    if (vfs_resolve_cwd(proc->cwd, path, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+    if (vfs_is_dir("/", abs_path) > 0) {
+        return -1;
+    }
+    if (create && vfs_touch("/", abs_path) != 0) {
+        return -1;
+    }
+
+    read_buf = (uint8_t*)kmalloc(SCHED_POSIX_FILE_MAX ? SCHED_POSIX_FILE_MAX : 1u);
+    if (!read_buf) {
+        return -1;
+    }
+    if (vfs_read_file("/", abs_path, read_buf, SCHED_POSIX_FILE_MAX, &read_size) != 0) {
+        kfree(read_buf);
+        return -1;
+    }
+    if (trunc) {
+        read_size = 0u;
+    }
+
+    slot = alloc_proc_file_handle(proc);
+    if (slot < 0) {
+        kfree(read_buf);
+        return -1;
+    }
+    handle = &proc->file_handles[slot];
+    mem_zero(handle, sizeof(*handle));
+    handle->used = 1u;
+    handle->readable = (uint8_t)(acc_mode != MYAOS_POSIX_O_WRONLY);
+    handle->writable = (uint8_t)(acc_mode != MYAOS_POSIX_O_RDONLY);
+    handle->append = (uint8_t)((flags & MYAOS_POSIX_O_APPEND) != 0u);
+    handle->dirty = 0u;
+    handle->size = 0u;
+    handle->capacity = 0u;
+    handle->offset = 0u;
+    handle->data = NULL;
+    str_copy(handle->abs_path, abs_path, sizeof(handle->abs_path));
+
+    if (read_size > 0u) {
+        if (ensure_file_capacity(handle, read_size) != 0) {
+            mem_zero(handle, sizeof(*handle));
+            kfree(read_buf);
+            return -1;
+        }
+        mem_copy(handle->data, read_buf, read_size);
+        handle->size = read_size;
+    }
+    handle->offset = handle->append ? handle->size : 0u;
+
+    if (trunc) {
+        uint8_t empty = 0u;
+        handle->dirty = 1u;
+        if (vfs_write_file("/", handle->abs_path, &empty, 0u) != 0) {
+            (void)close_proc_file_handle(proc, slot + 1);
+            kfree(read_buf);
+            return -1;
+        }
+        handle->dirty = 0u;
+    }
+
+    *out_fd = slot + 1;
+    kfree(read_buf);
+    return 0;
+}
+
+int scheduler_posix_close(int32_t fd) {
+    sched_proc_t* proc = current_proc();
+    return close_proc_file_handle(proc, (int)fd);
+}
+
+int scheduler_posix_read(int32_t fd, void* out_buf, uint32_t max_len, uint32_t* out_read) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* handle;
+    uint8_t* out = (uint8_t*)out_buf;
+    uint32_t copy_len;
+
+    if (!proc || !out_read || (max_len != 0u && !out)) {
+        return -1;
+    }
+
+    handle = proc_file_handle_for_fd(proc, fd, FILE_MODE_READ);
+    if (!handle) {
+        return -1;
+    }
+    if (max_len == 0u || handle->offset >= handle->size) {
+        *out_read = 0u;
+        return 0;
+    }
+
+    copy_len = handle->size - handle->offset;
+    if (copy_len > max_len) {
+        copy_len = max_len;
+    }
+    mem_copy(out, handle->data + handle->offset, copy_len);
+    handle->offset += copy_len;
+    *out_read = copy_len;
+    return 0;
+}
+
+int scheduler_posix_write(int32_t fd, const void* data, uint32_t len, uint32_t* out_written) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* handle;
+    const uint8_t* in = (const uint8_t*)data;
+    uint32_t write_pos;
+    uint32_t new_end;
+
+    if (!proc || !out_written || (len != 0u && !in)) {
+        return -1;
+    }
+
+    handle = proc_file_handle_for_fd(proc, fd, FILE_MODE_WRITE);
+    if (!handle) {
+        return -1;
+    }
+    if (len == 0u) {
+        *out_written = 0u;
+        return 0;
+    }
+
+    write_pos = handle->append ? handle->size : handle->offset;
+    if (write_pos > SCHED_POSIX_FILE_MAX || len > SCHED_POSIX_FILE_MAX || write_pos + len < write_pos ||
+        write_pos + len > SCHED_POSIX_FILE_MAX) {
+        return -1;
+    }
+    new_end = write_pos + len;
+    if (ensure_file_capacity(handle, new_end) != 0) {
+        return -1;
+    }
+
+    mem_copy(handle->data + write_pos, in, len);
+    handle->offset = new_end;
+    if (new_end > handle->size) {
+        handle->size = new_end;
+    }
+    handle->dirty = 1u;
+    if (vfs_write_file("/", handle->abs_path, handle->data, handle->size) != 0) {
+        return -1;
+    }
+    handle->dirty = 0u;
+    *out_written = len;
+    return 0;
+}
+
+int scheduler_posix_lseek(int32_t fd, int64_t offset, uint32_t whence, uint64_t* out_offset) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* handle;
+    int64_t base;
+    int64_t next;
+
+    if (!proc) {
+        return -1;
+    }
+
+    handle = proc_file_handle_for_fd(proc, fd, 0u);
+    if (!handle) {
+        return -1;
+    }
+
+    switch (whence) {
+    case MYAOS_POSIX_SEEK_SET:
+        base = 0;
+        break;
+    case MYAOS_POSIX_SEEK_CUR:
+        base = (int64_t)handle->offset;
+        break;
+    case MYAOS_POSIX_SEEK_END:
+        base = (int64_t)handle->size;
+        break;
+    default:
+        return -1;
+    }
+
+    next = base + offset;
+    if (next < 0 || (uint64_t)next > SCHED_POSIX_FILE_MAX) {
+        return -1;
+    }
+    handle->offset = (uint32_t)next;
+    if (out_offset) {
+        *out_offset = (uint64_t)handle->offset;
+    }
+    return 0;
+}
+
+int scheduler_posix_fstat(int32_t fd, myaos_posix_stat_t* out) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* handle;
+    uint32_t mode = SCHED_POSIX_S_IFREG;
+
+    if (!proc || !out) {
+        return -1;
+    }
+
+    handle = proc_file_handle_for_fd(proc, fd, 0u);
+    if (!handle) {
+        return -1;
+    }
+
+    if (handle->readable) {
+        mode |= 0444u;
+    }
+    if (handle->writable) {
+        mode |= 0222u;
+    }
+    out->size = handle->size;
+    out->mode = mode;
+    out->uid = proc->uid;
+    return 0;
+}
+
+int scheduler_posix_dup2(int32_t old_fd, int32_t new_fd) {
+    sched_proc_t* proc = current_proc();
+    proc_file_handle_t* src;
+
+    if (!proc || old_fd <= 0 || new_fd <= 0 || old_fd > (int32_t)SCHED_MAX_FILE_HANDLES ||
+        new_fd > (int32_t)SCHED_MAX_FILE_HANDLES) {
+        return -1;
+    }
+    src = proc_file_handle_for_fd(proc, old_fd, 0u);
+    if (!src) {
+        return -1;
+    }
+    if (old_fd == new_fd) {
+        return new_fd;
+    }
+
+    if (proc->file_handles[(uint32_t)(new_fd - 1)].used) {
+        (void)close_proc_file_handle(proc, (int)new_fd);
+    }
+    if (clone_proc_file_handle(&proc->file_handles[(uint32_t)(new_fd - 1)], src) != 0) {
+        return -1;
+    }
+    return new_fd;
+}
+
+int scheduler_posix_poll(myaos_posix_pollfd_t* fds, uint32_t count, uint32_t timeout_ticks, uint32_t* out_ready) {
+    sched_proc_t* proc = current_proc();
+    uint32_t ready = 0u;
+
+    if (!proc || !out_ready) {
+        return -1;
+    }
+    if (count == 0u) {
+        if (timeout_ticks > 0u) {
+            scheduler_sleep_current((uint64_t)timeout_ticks);
+        }
+        *out_ready = 0u;
+        return 0;
+    }
+    if (!fds || count > 256u) {
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        proc_file_handle_t* handle;
+        int16_t revents = 0;
+
+        fds[i].revents = 0;
+        handle = proc_file_handle_for_fd(proc, fds[i].fd, 0u);
+        if (!handle) {
+            fds[i].revents = MYAOS_POSIX_POLLERR;
+            ready++;
+            continue;
+        }
+
+        if ((fds[i].events & MYAOS_POSIX_POLLIN) != 0 && handle->offset < handle->size) {
+            revents |= MYAOS_POSIX_POLLIN;
+        }
+        if ((fds[i].events & MYAOS_POSIX_POLLOUT) != 0) {
+            revents |= handle->writable ? MYAOS_POSIX_POLLOUT : MYAOS_POSIX_POLLERR;
+        }
+
+        fds[i].revents = revents;
+        if (revents != 0) {
+            ready++;
+        }
+    }
+
+    if (ready == 0u && timeout_ticks > 0u) {
+        scheduler_sleep_current((uint64_t)timeout_ticks);
+    }
+    *out_ready = ready;
+    return 0;
+}
+
 int scheduler_thread_create_current(uint64_t entry, uint64_t arg, uint64_t stack_top, int32_t* out_tid) {
     sched_proc_t* parent = current_proc();
     sched_proc_t* thread;
@@ -2151,6 +3241,7 @@ int scheduler_thread_create_current(uint64_t entry, uint64_t arg, uint64_t stack
 
     thread->entry = NULL;
     thread->thread_mode = 1u;
+    thread->linux_compat = parent->linux_compat;
     thread->thread_group = parent->thread_group ? parent->thread_group : parent->pid;
     thread->thread_arg = arg;
     thread->user_mode = 1u;
@@ -2166,6 +3257,10 @@ int scheduler_thread_create_current(uint64_t entry, uint64_t arg, uint64_t stack
     thread->user_region_base = parent->user_region_base;
     thread->user_region_end = parent->user_region_end;
     thread->user_mmap_next = parent->user_mmap_next;
+    thread->user_fs_base = parent->user_fs_base;
+    thread->linux_brk_base = parent->linux_brk_base;
+    thread->linux_brk_current = parent->linux_brk_current;
+    thread->linux_brk_limit = parent->linux_brk_limit;
     mem_copy(thread->user_maps, parent->user_maps, sizeof(thread->user_maps));
     thread->user_entry = entry;
     thread->user_rsp = start_rsp;
@@ -2189,6 +3284,176 @@ int scheduler_thread_create_current(uint64_t entry, uint64_t arg, uint64_t stack
     if (out_tid) {
         *out_tid = (int32_t)thread->pid;
     }
+    return 0;
+}
+
+int scheduler_linux_clone_current(
+    uint64_t frame_rsp,
+    uint64_t flags,
+    uint64_t child_stack,
+    int32_t* parent_tid_ptr,
+    int32_t* child_tid_ptr,
+    uint64_t tls,
+    int32_t* out_tid
+) {
+    sched_proc_t* parent = current_proc();
+    sched_proc_t* thread;
+    isr_context_t* parent_frame;
+    isr_context_t* child_frame;
+    uint64_t next_rip;
+    uint64_t next_rsp;
+    uint64_t unsupported;
+    uint8_t thread_style = 0u;
+    uint8_t process_style = 0u;
+    uint8_t shared_vm = 0u;
+    uint8_t deep_copy_process_vm = 1u;
+    int slot;
+    int32_t tid;
+
+    if (!parent || !out_tid || frame_rsp == 0u || !parent->user_mode || !parent->linux_compat ||
+        parent->page_table_cr3 == 0u) {
+        return -1;
+    }
+
+    unsupported = flags & ~(LINUX_CLONE_SUPPORTED_FLAGS | LINUX_CLONE_SIGNAL_MASK);
+    if (unsupported != 0u) {
+        return -1;
+    }
+
+    thread_style = ((flags & (LINUX_CLONE_VM | LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND)) ==
+                    (LINUX_CLONE_VM | LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND))
+                       ? 1u
+                       : 0u;
+    process_style = ((flags & (LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND)) == 0u) ? 1u : 0u;
+    shared_vm = ((flags & LINUX_CLONE_VM) != 0u) ? 1u : 0u;
+
+    if (!thread_style && !process_style) {
+        return -1;
+    }
+
+    parent_frame = (isr_context_t*)(uintptr_t)frame_rsp;
+    if ((parent_frame->cs & 0x3u) != 0x3u) {
+        return -1;
+    }
+
+    next_rip = parent_frame->rip + 2u;
+    next_rsp = child_stack ? child_stack : parent_frame->rsp;
+    if (next_rsp <= parent->user_region_base || next_rsp > parent->user_region_end) {
+        return -1;
+    }
+    if (!paging_user_range_accessible(next_rsp - 1u, 1u, 0u)) {
+        return -1;
+    }
+    if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u) {
+        if (!parent_tid_ptr ||
+            !paging_user_range_accessible((uint64_t)(uintptr_t)parent_tid_ptr, sizeof(*parent_tid_ptr), 1u)) {
+            return -1;
+        }
+    }
+    if ((flags & LINUX_CLONE_CHILD_SETTID) != 0u || (flags & LINUX_CLONE_CHILD_CLEARTID) != 0u) {
+        if (!child_tid_ptr ||
+            !paging_user_range_accessible((uint64_t)(uintptr_t)child_tid_ptr, sizeof(*child_tid_ptr), 1u)) {
+            return -1;
+        }
+    }
+
+    slot = alloc_proc_slot();
+    if (slot < 0) {
+        return -1;
+    }
+    if (init_proc_common(
+            (uint32_t)slot,
+            "thread",
+            0,
+            NULL,
+            parent->cwd,
+            parent->background,
+            parent->pid
+        ) != 0) {
+        return -1;
+    }
+
+    thread = &g_procs[slot];
+    if (thread->argv_block) {
+        kfree(thread->argv_block);
+        thread->argv_block = NULL;
+        thread->argv = NULL;
+        thread->argc = 0;
+    }
+
+    thread->entry = NULL;
+    thread->thread_mode = thread_style ? 1u : 0u;
+    thread->linux_compat = 1u;
+    thread->thread_group = thread_style ? (parent->thread_group ? parent->thread_group : parent->pid) : thread->pid;
+    thread->thread_arg = 0u;
+    thread->priority = parent->priority;
+    thread->sched_budget = priority_budget(thread->priority);
+    thread->user_mode = 1u;
+    thread->page_table_cr3 = parent->page_table_cr3;
+    thread->vm_limit_bytes = parent->vm_limit_bytes;
+    thread->user_image_base = parent->user_image_base;
+    thread->user_image_size = parent->user_image_size;
+    thread->user_argv_base = parent->user_argv_base;
+    thread->user_argv_size = parent->user_argv_size;
+    thread->user_stack_base = parent->user_stack_base;
+    thread->user_stack_size = parent->user_stack_size;
+    thread->user_trampoline = parent->user_trampoline;
+    thread->user_region_base = parent->user_region_base;
+    thread->user_region_end = parent->user_region_end;
+    thread->user_mmap_next = parent->user_mmap_next;
+    thread->user_fs_base = ((flags & LINUX_CLONE_SETTLS) != 0u) ? tls : parent->user_fs_base;
+    thread->linux_brk_base = parent->linux_brk_base;
+    thread->linux_brk_current = parent->linux_brk_current;
+    thread->linux_brk_limit = parent->linux_brk_limit;
+    mem_copy(thread->user_maps, parent->user_maps, sizeof(thread->user_maps));
+    thread->user_entry = next_rip;
+    thread->user_rsp = next_rsp;
+    thread->user_argv_ptr = parent->user_argv_ptr;
+    str_copy(thread->name, parent->name, sizeof(thread->name));
+    thread->wait_vfork = 0u;
+
+    if (process_style && !shared_vm && deep_copy_process_vm) {
+        if (clone_process_user_space(parent, thread) != 0) {
+            release_proc_slot(thread);
+            return -1;
+        }
+    }
+
+    child_frame = (isr_context_t*)(uintptr_t)(thread->kernel_stack_top - sizeof(isr_context_t));
+    if (!child_frame) {
+        release_proc_slot(thread);
+        return -1;
+    }
+    mem_copy(child_frame, parent_frame, sizeof(*child_frame));
+    child_frame->rax = 0u;
+    child_frame->rip = next_rip;
+    child_frame->rsp = next_rsp;
+    thread->saved_rsp = (uint64_t)(uintptr_t)child_frame;
+
+    tid = (int32_t)thread->pid;
+    if ((flags & LINUX_CLONE_PARENT_SETTID) != 0u) {
+        proc_write_i32_ptr(parent, parent_tid_ptr, tid);
+    }
+    if ((flags & LINUX_CLONE_CHILD_SETTID) != 0u) {
+        proc_write_i32_ptr(thread, child_tid_ptr, tid);
+    }
+    if (process_style && shared_vm) {
+        /* Shared-VM process-style clone is treated as vfork-style: parent
+           stays blocked until child exec/exit to avoid shared-stack races. */
+        parent->state = MYAOS_PROC_BLOCKED;
+        parent->wait_pid = tid;
+        parent->wait_exit_ptr = NULL;
+        parent->wait_notify_active = 0u;
+        parent->wait_notify_clear = 0u;
+        parent->wait_notify_reserved0 = 0u;
+        parent->wait_notify_mask = 0u;
+        parent->wait_notify_out_ptr = NULL;
+        parent->wait_notify_deadline = 0u;
+        parent->wait_vfork = 1u;
+        g_resched_mode = RESCHED_SAVE;
+    }
+
+    *out_tid = tid;
     return 0;
 }
 
@@ -2438,7 +3703,13 @@ int scheduler_mem_map_current(uint64_t size, uint8_t writable, uint64_t* out_add
     }
 
     map_window_start = proc->user_region_base + USER_MMAP_MIN_OFFSET;
-    map_window_end = proc->user_argv_base;
+    if (proc->user_argv_base != 0u) {
+        map_window_end = proc->user_argv_base;
+    } else {
+        /* Linux compat keeps argv/env on the initial stack and does not reserve
+           a dedicated argv mapping region, so mmap must stop before stack pages. */
+        map_window_end = proc->user_stack_base;
+    }
     if (map_window_end <= map_window_start) {
         return -1;
     }
@@ -2827,5 +4098,112 @@ int scheduler_getcwd_current(char* out, size_t out_size) {
         return -1;
     }
     str_copy(out, scheduler_current_cwd(), out_size);
+    return 0;
+}
+
+int scheduler_proc_name_set_current(const char* name) {
+    sched_proc_t* proc = current_proc();
+
+    if (!proc || !name || !name[0]) {
+        return -1;
+    }
+    str_copy(proc->name, name, sizeof(proc->name));
+    return 0;
+}
+
+int scheduler_proc_name_get_current(char* out, size_t out_size) {
+    sched_proc_t* proc = current_proc();
+
+    if (!proc || !out || out_size == 0u) {
+        return -1;
+    }
+    str_copy(out, proc->name, out_size);
+    return 0;
+}
+
+int scheduler_current_linux_compat(void) {
+    sched_proc_t* proc = current_proc();
+    return (proc && proc->user_mode && proc->linux_compat) ? 1 : 0;
+}
+
+int scheduler_linux_brk(uint64_t requested, uint64_t* out_brk) {
+    sched_proc_t* proc = current_proc();
+    uint64_t target;
+    uint64_t prev_cr3;
+
+    if (!proc || !out_brk || !proc->user_mode || !proc->linux_compat) {
+        return -1;
+    }
+
+    if (proc->linux_brk_base == 0u) {
+        proc->linux_brk_base = align_up(proc->user_image_base + proc->user_image_size, PAGE_SIZE);
+        proc->linux_brk_current = proc->linux_brk_base;
+        proc->linux_brk_limit = proc->linux_brk_base;
+    }
+
+    if (requested == 0u) {
+        *out_brk = proc->linux_brk_current;
+        return 0;
+    }
+    if (requested < proc->linux_brk_base || requested >= proc->user_region_end) {
+        *out_brk = proc->linux_brk_current;
+        return 0;
+    }
+
+    target = align_up(requested, PAGE_SIZE);
+    if (target < proc->linux_brk_base || target > proc->user_region_end) {
+        *out_brk = proc->linux_brk_current;
+        return 0;
+    }
+
+    if (target > proc->linux_brk_limit) {
+        uint64_t grow = target - proc->linux_brk_limit;
+        if (grow == 0u) {
+            proc->linux_brk_limit = target;
+        } else {
+            prev_cr3 = paging_current_cr3();
+            if (prev_cr3 != proc->page_table_cr3) {
+                if (paging_switch_to(proc->page_table_cr3) != 0) {
+                    *out_brk = proc->linux_brk_current;
+                    return 0;
+                }
+            }
+            if (paging_alloc_user_range(proc->linux_brk_limit, grow, 1u) != 0) {
+                if (prev_cr3 != proc->page_table_cr3) {
+                    (void)paging_switch_to(prev_cr3);
+                }
+                *out_brk = proc->linux_brk_current;
+                return 0;
+            }
+            if (prev_cr3 != proc->page_table_cr3) {
+                (void)paging_switch_to(prev_cr3);
+            }
+            proc->linux_brk_limit = target;
+        }
+    }
+
+    proc->linux_brk_current = requested;
+    *out_brk = proc->linux_brk_current;
+    return 0;
+}
+
+int scheduler_linux_fs_base_set(uint64_t fs_base) {
+    sched_proc_t* proc = current_proc();
+
+    if (!proc || !proc->user_mode || !proc->linux_compat) {
+        return -1;
+    }
+    proc->user_fs_base = fs_base;
+    load_proc_fs_base(proc);
+    return 0;
+}
+
+int scheduler_linux_fs_base_get(uint64_t* out_fs_base) {
+    sched_proc_t* proc = current_proc();
+
+    if (!proc || !out_fs_base || !proc->user_mode || !proc->linux_compat) {
+        return -1;
+    }
+    *out_fs_base = proc->user_fs_base;
     return 0;
 }

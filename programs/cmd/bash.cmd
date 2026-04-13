@@ -1,2 +1,2 @@
 exec=/bin/msh.elf
-bash compatibility alias for shell
+legacy alias for msh shell (prefer: sh or msh)

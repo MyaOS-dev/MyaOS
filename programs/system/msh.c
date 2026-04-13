@@ -1,25 +1,25 @@
 #include "../lib/myaos.h"
 #include <stdint.h>
 
-#define BASH_INPUT_MAX 256
-#define BASH_ARGV_MAX 16
-#define BASH_MANIFEST_MAX 256
-#define BASH_SCRIPT_MAX 4096
-#define BASH_MANIFEST_CACHE_MAX 32
+#define MSH_INPUT_MAX 256
+#define MSH_ARGV_MAX 16
+#define MSH_MANIFEST_MAX 256
+#define MSH_SCRIPT_MAX 4096
+#define MSH_MANIFEST_CACHE_MAX 32
 
 typedef struct {
-    char* argv[BASH_ARGV_MAX];
+    char* argv[MSH_ARGV_MAX];
     int argc;
     uint8_t background;
-} bash_cmd_t;
+} msh_cmd_t;
 
 typedef struct {
     uint8_t used;
     char name[MYAOS_NAME_MAX];
     char exec_path[MYAOS_PATH_MAX];
-} bash_manifest_cache_entry_t;
+} msh_manifest_cache_entry_t;
 
-static bash_manifest_cache_entry_t g_manifest_cache[BASH_MANIFEST_CACHE_MAX];
+static msh_manifest_cache_entry_t g_manifest_cache[MSH_MANIFEST_CACHE_MAX];
 
 static size_t str_len(const char* s) {
     size_t n = 0;
@@ -177,6 +177,17 @@ static int is_space(char c) {
     return c == ' ' || c == '\t';
 }
 
+static size_t utf8_prev_start(const char* text, size_t pos) {
+    if (!text || pos == 0u) {
+        return 0u;
+    }
+    pos--;
+    while (pos > 0u && (((uint8_t)text[pos] & 0xC0u) == 0x80u)) {
+        pos--;
+    }
+    return pos;
+}
+
 static int read_line(char* out, size_t out_size) {
     size_t len = 0;
 
@@ -208,13 +219,13 @@ static int read_line(char* out, size_t out_size) {
         }
         if (ch == '\b' || ch == 127) {
             if (len > 0) {
-                len--;
+                len = utf8_prev_start(out, len);
                 out[len] = '\0';
                 mya_puts("\b");
             }
             continue;
         }
-        if (ch < 32 || ch > 126) {
+        if (((uint8_t)ch < 32u) || ((uint8_t)ch == 127u)) {
             continue;
         }
         if (len + 1 < out_size) {
@@ -230,7 +241,7 @@ static int read_line(char* out, size_t out_size) {
     }
 }
 
-static int tokenize_line(char* line, bash_cmd_t* out) {
+static int tokenize_line(char* line, msh_cmd_t* out) {
     char* p = line;
     int argc = 0;
 
@@ -247,7 +258,7 @@ static int tokenize_line(char* line, bash_cmd_t* out) {
         if (!*p) {
             break;
         }
-        if (argc >= BASH_ARGV_MAX) {
+        if (argc >= MSH_ARGV_MAX) {
             return -1;
         }
         out->argv[argc++] = p;
@@ -271,7 +282,7 @@ static int tokenize_line(char* line, bash_cmd_t* out) {
 static int read_manifest_exec(const char* cmd, char* out_exec, size_t out_size) {
     char cmd_key[MYAOS_NAME_MAX];
     char path[MYAOS_PATH_MAX];
-    uint8_t buf[BASH_MANIFEST_MAX];
+    uint8_t buf[MSH_MANIFEST_MAX];
     uint32_t read_size = 0;
     size_t i = 0;
     size_t pos = 0;
@@ -284,7 +295,7 @@ static int read_manifest_exec(const char* cmd, char* out_exec, size_t out_size) 
         cmd_key[ci] = to_lower_char(cmd_key[ci]);
     }
 
-    for (uint32_t ci = 0; ci < BASH_MANIFEST_CACHE_MAX; ci++) {
+    for (uint32_t ci = 0; ci < MSH_MANIFEST_CACHE_MAX; ci++) {
         if (!g_manifest_cache[ci].used || !str_eq(g_manifest_cache[ci].name, cmd_key)) {
             continue;
         }
@@ -383,7 +394,7 @@ static int read_manifest_exec(const char* cmd, char* out_exec, size_t out_size) 
     }
 
     if (out_exec[0]) {
-        for (uint32_t ci = 0; ci < BASH_MANIFEST_CACHE_MAX; ci++) {
+        for (uint32_t ci = 0; ci < MSH_MANIFEST_CACHE_MAX; ci++) {
             if (!g_manifest_cache[ci].used || str_eq(g_manifest_cache[ci].name, cmd_key)) {
                 g_manifest_cache[ci].used = 1u;
                 str_copy(g_manifest_cache[ci].name, cmd_key, sizeof(g_manifest_cache[ci].name));
@@ -444,7 +455,7 @@ static int build_boot_exec_path(const char* exec_path, char* out, size_t out_siz
     return 0;
 }
 
-static int spawn_command(const bash_cmd_t* cmd) {
+static int spawn_command(const msh_cmd_t* cmd) {
     char exec_path[MYAOS_PATH_MAX];
     char resolved_exec[MYAOS_PATH_MAX];
     int32_t pid = -1;
@@ -531,7 +542,7 @@ static void print_help(void) {
 static int execute_line(char* line, uint8_t* out_should_exit);
 
 static int run_script(const char* path) {
-    static uint8_t buf[BASH_SCRIPT_MAX];
+    static uint8_t buf[MSH_SCRIPT_MAX];
     uint32_t read_size = 0;
     size_t line_start = 0;
 
@@ -544,7 +555,7 @@ static int run_script(const char* path) {
     buf[read_size] = 0;
     for (size_t i = 0; i <= read_size; i++) {
         if (i == read_size || buf[i] == '\n' || buf[i] == '\r') {
-            char line[BASH_INPUT_MAX];
+            char line[MSH_INPUT_MAX];
             size_t j = 0;
             uint8_t should_exit = 0;
 
@@ -574,7 +585,7 @@ static int run_script(const char* path) {
 }
 
 static int execute_line(char* line, uint8_t* out_should_exit) {
-    bash_cmd_t cmd;
+    msh_cmd_t cmd;
 
     if (!line || !out_should_exit) {
         return -1;
@@ -615,7 +626,7 @@ static int execute_line(char* line, uint8_t* out_should_exit) {
         return 0;
     }
     if (str_eq(cmd.argv[0], "load")) {
-        bash_cmd_t load_cmd;
+        msh_cmd_t load_cmd;
         if (cmd.argc < 2) {
             mya_putln("usage: load PATH.elf [args...]");
             return 2;
@@ -637,11 +648,13 @@ static int execute_line(char* line, uint8_t* out_should_exit) {
 }
 
 int program_main(int argc, char** argv) {
-    char line[BASH_INPUT_MAX];
-    (void)argc;
-    (void)argv;
+    char line[MSH_INPUT_MAX];
+    int last_status = 0;
+    if (argv == NULL) {
+        return 1;
+    }
 
-    for (uint32_t i = 0; i < BASH_MANIFEST_CACHE_MAX; i++) {
+    for (uint32_t i = 0; i < MSH_MANIFEST_CACHE_MAX; i++) {
         g_manifest_cache[i].used = 0u;
         g_manifest_cache[i].name[0] = '\0';
         g_manifest_cache[i].exec_path[0] = '\0';
@@ -650,6 +663,15 @@ int program_main(int argc, char** argv) {
     mya_putln("msh userspace shell");
     mya_putln("type help");
 
+    if (argc >= 3 && str_eq(argv[1], "-c")) {
+        uint8_t should_exit = 0;
+        str_copy(line, argv[2], sizeof(line));
+        return execute_line(line, &should_exit);
+    }
+    if (argc >= 2 && str_ends_with(argv[1], ".sh")) {
+        return run_script(argv[1]);
+    }
+
     for (;;) {
         char cwd[MYAOS_PATH_MAX];
         uint8_t should_exit = 0;
@@ -657,6 +679,9 @@ int program_main(int argc, char** argv) {
         if (mya_fs_getcwd(cwd, sizeof(cwd)) != 0) {
             str_copy(cwd, "/", sizeof(cwd));
         }
+        mya_puts("[");
+        mya_put_u32((uint32_t)last_status);
+        mya_puts("] ");
         mya_puts(cwd);
         mya_puts(" msh $ ");
 
@@ -668,7 +693,7 @@ int program_main(int argc, char** argv) {
             continue;
         }
 
-        (void)execute_line(line, &should_exit);
+        last_status = execute_line(line, &should_exit);
         if (should_exit) {
             break;
         }

@@ -170,9 +170,16 @@ static uint8_t acl_has_perm(const vfs_acl_t* acl, uint8_t required) {
 }
 
 static int acl_check(const char* abs_path, uint8_t required, uint8_t is_dir_hint, uint8_t owner_is_current_on_create) {
-    vfs_acl_t* acl = acl_ensure(abs_path, is_dir_hint, owner_is_current_on_create);
+    vfs_acl_t* acl = acl_find(abs_path);
+    vfs_acl_t fallback;
+
     if (!acl) {
-        return -1;
+        fallback.used = 1u;
+        fallback.is_dir = is_dir_hint;
+        fallback.mode = default_mode_for_path(abs_path, is_dir_hint);
+        fallback.owner_uid = owner_is_current_on_create ? scheduler_current_uid() : 0u;
+        fallback.path[0] = '\0';
+        acl = &fallback;
     }
     return acl_has_perm(acl, required) ? 0 : -1;
 }
@@ -295,6 +302,19 @@ static int copy_prefix(char* dst, const char* src, size_t start, size_t end, siz
     return 0;
 }
 
+static void strip_mount_marker_suffix(char* part) {
+    size_t len;
+
+    if (!part || !part[0]) {
+        return;
+    }
+
+    len = str_len(part);
+    if (len > 1u && part[len - 1u] == '@') {
+        part[len - 1u] = '\0';
+    }
+}
+
 static int normalize_absolute_path(const char* path, char* out_abs_path, size_t out_size) {
     char parts[16][MYAOS_NAME_MAX];
     uint32_t depth = 0;
@@ -325,6 +345,7 @@ static int normalize_absolute_path(const char* path, char* out_abs_path, size_t 
         if (copy_prefix(part, path, start, end, sizeof(part)) != 0) {
             return -1;
         }
+        strip_mount_marker_suffix(part);
 
         if (str_eq(part, ".")) {
             continue;
@@ -628,6 +649,7 @@ int vfs_write_file(const char* cwd, const char* path, const uint8_t* data, uint3
     if (vfs_resolve_cwd(cwd, path, abs_path, sizeof(abs_path)) != 0) {
         return -1;
     }
+    (void)acl_ensure(abs_path, 0u, 1u);
     if (acl_check(abs_path, VFS_PERM_W, 0u, 1u) != 0) {
         return -1;
     }
@@ -777,11 +799,91 @@ int vfs_is_dir(const char* cwd, const char* path) {
 
 int vfs_can_exec(const char* cwd, const char* path) {
     char abs_path[MYAOS_PATH_MAX];
+    vfs_acl_t* acl;
+    uint8_t hdr[4];
+    uint32_t got = 0u;
 
     if (vfs_resolve_cwd(cwd, path, abs_path, sizeof(abs_path)) != 0) {
         return -1;
     }
+
+    acl = acl_find(abs_path);
+    if (acl) {
+        return acl_check(abs_path, VFS_PERM_X, 0u, 0u);
+    }
+
+    if (vfs_is_dir("/", abs_path) > 0) {
+        return -1;
+    }
+    if (path_has_suffix(abs_path, ".elf")) {
+        return 0;
+    }
+
+    if (vfs_read_file("/", abs_path, hdr, sizeof(hdr), &got) == 0 &&
+        got >= sizeof(hdr) &&
+        hdr[0] == 0x7Fu && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        return 0;
+    }
+
     return acl_check(abs_path, VFS_PERM_X, 0u, 0u);
+}
+
+int vfs_chmod(const char* cwd, const char* path, uint16_t mode) {
+    char abs_path[MYAOS_PATH_MAX];
+    vfs_acl_t* acl;
+    uint32_t uid = scheduler_current_uid();
+    int is_dir_rc;
+
+    if (vfs_resolve_cwd(cwd, path, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+
+    acl = acl_find(abs_path);
+    if (!acl) {
+        is_dir_rc = vfs_is_dir("/", abs_path);
+        if (is_dir_rc < 0) {
+            return -1;
+        }
+        acl = acl_ensure(abs_path, is_dir_rc > 0 ? 1u : 0u, 0u);
+        if (!acl) {
+            return -1;
+        }
+    }
+
+    if (uid != 0u && uid != acl->owner_uid) {
+        return -1;
+    }
+
+    acl->mode = (uint16_t)(mode & 0777u);
+    return 0;
+}
+
+int vfs_chown(const char* cwd, const char* path, uint32_t owner_uid) {
+    char abs_path[MYAOS_PATH_MAX];
+    vfs_acl_t* acl;
+    int is_dir_rc;
+
+    if (scheduler_current_uid() != 0u) {
+        return -1;
+    }
+    if (vfs_resolve_cwd(cwd, path, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+
+    acl = acl_find(abs_path);
+    if (!acl) {
+        is_dir_rc = vfs_is_dir("/", abs_path);
+        if (is_dir_rc < 0) {
+            return -1;
+        }
+        acl = acl_ensure(abs_path, is_dir_rc > 0 ? 1u : 0u, 0u);
+        if (!acl) {
+            return -1;
+        }
+    }
+
+    acl->owner_uid = owner_uid;
+    return 0;
 }
 
 int vfs_sync_all(void) {

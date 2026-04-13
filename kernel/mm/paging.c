@@ -402,7 +402,9 @@ int paging_alloc_user_range(uint64_t virt_addr, uint64_t size, uint8_t writable)
             return -1;
         }
 
-        page_ptr = (uint8_t*)(uintptr_t)addr;
+        /* Zero through identity-mapped physical address so kernel writes do
+           not depend on user RW permissions of the virtual mapping. */
+        page_ptr = (uint8_t*)(uintptr_t)phys;
         mem_zero(page_ptr, PAGE_SIZE);
     }
 

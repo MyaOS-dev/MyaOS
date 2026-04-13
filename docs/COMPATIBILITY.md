@@ -9,6 +9,8 @@ System call ABI is versioned in `include/myaos/syscall.h` using:
 - `MYAOS_ABI_VERSION_PATCH`
 - `MYAOS_ABI_VERSION`
 
+Authoritative freeze policy for v1.x is documented in `docs/ABI.md`.
+
 Policy:
 
 - Patch/minor updates must remain backward-compatible for existing user programs.
@@ -34,7 +36,17 @@ This policy currently covers:
 - package ABI gating
 - repository upgrade selection
 
+Related status docs:
+
+- Linux userspace compatibility matrix: `docs/LINUX_COMPAT_MATRIX.md`
+- subsystem rollout status: `docs/SUBSYSTEM_STATUS.md`
+
 Future work (not yet implemented):
 
 - dynamic linker ABI compatibility contracts
-- kernel module ABI compatibility policy
+- detailed kernel module ABI compatibility policy (version negotiation beyond `MYAOS_KMOD_ABI_VERSION`)
+
+## Legacy Compatibility Layers
+
+- `compat` command is migration-only and should not receive new feature work.
+- Unix-style alias command names are transitional and should not replace native naming in new tooling/docs.

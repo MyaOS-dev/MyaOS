@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define MYAOS_ABI_VERSION_MAJOR 1u
-#define MYAOS_ABI_VERSION_MINOR 8u
+#define MYAOS_ABI_VERSION_MINOR 15u
 #define MYAOS_ABI_VERSION_PATCH 0u
 #define MYAOS_ABI_VERSION_ENCODE(major, minor, patch) (((major) * 10000u) + ((minor) * 100u) + (patch))
 #define MYAOS_ABI_VERSION \
@@ -145,6 +145,7 @@ typedef struct {
 enum {
     MYAOS_SPAWN_BACKGROUND = 0x1u,
     MYAOS_SPAWN_STDOUT_REDIRECT = 0x2u,
+    MYAOS_SPAWN_LINUX = 0x4u,
 };
 
 enum {
@@ -180,6 +181,133 @@ typedef struct {
     uint8_t optional;
     uint16_t reserved0;
 } myaos_module_info_t;
+
+typedef struct {
+    uint64_t size;
+    uint32_t mode;
+    uint32_t uid;
+} myaos_posix_stat_t;
+
+typedef struct {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+} myaos_posix_pollfd_t;
+
+typedef struct {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t format;
+    uint32_t mode;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} myaos_gfx_info_t;
+
+typedef struct {
+    uint32_t type;
+    int32_t x0;
+    int32_t y0;
+    int32_t x1;
+    int32_t y1;
+    uint32_t color;
+    uint32_t color2;
+    uint64_t text_ptr;
+    uint32_t text_len;
+    uint32_t flags;
+} myaos_gfx_object_t;
+
+typedef struct {
+    int32_t dst_x;
+    int32_t dst_y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t src_stride;
+    uint32_t src_format;
+    uint64_t src_ptr;
+    uint32_t flags;
+} myaos_gfx_blit_t;
+
+typedef struct {
+    uint16_t keycode;
+    uint8_t action;
+    uint8_t modifiers;
+    uint32_t ascii;
+    uint64_t tick;
+} myaos_input_key_event_t;
+
+enum {
+    MYAOS_POSIX_O_ACCMODE = 0x0003u,
+    MYAOS_POSIX_O_RDONLY = 0x0000u,
+    MYAOS_POSIX_O_WRONLY = 0x0001u,
+    MYAOS_POSIX_O_RDWR = 0x0002u,
+    MYAOS_POSIX_O_CREAT = 0x0040u,
+    MYAOS_POSIX_O_TRUNC = 0x0200u,
+    MYAOS_POSIX_O_APPEND = 0x0400u,
+};
+
+enum {
+    MYAOS_POSIX_SEEK_SET = 0,
+    MYAOS_POSIX_SEEK_CUR = 1,
+    MYAOS_POSIX_SEEK_END = 2,
+};
+
+enum {
+    MYAOS_POSIX_POLLIN = 0x0001,
+    MYAOS_POSIX_POLLOUT = 0x0004,
+    MYAOS_POSIX_POLLERR = 0x0008,
+};
+
+enum {
+    MYAOS_GFX_MODE_TEXT = 0u,
+    MYAOS_GFX_MODE_GRAPHICS = 1u,
+};
+
+enum {
+    MYAOS_GFX_OBJ_CLEAR = 1u,
+    MYAOS_GFX_OBJ_PIXEL = 2u,
+    MYAOS_GFX_OBJ_LINE = 3u,
+    MYAOS_GFX_OBJ_RECT = 4u,
+    MYAOS_GFX_OBJ_FRAME = 5u,
+    MYAOS_GFX_OBJ_TEXT = 6u,
+};
+
+enum {
+    MYAOS_GFX_TEXT_TRANSPARENT_BG = 0x0001u,
+};
+
+enum {
+    MYAOS_GFX_SRC_BGR24 = 1u,
+    MYAOS_GFX_SRC_BGRA32 = 2u,
+    MYAOS_GFX_SRC_RGB24 = 3u,
+    MYAOS_GFX_SRC_RGBA32 = 4u,
+};
+
+enum {
+    MYAOS_GFX_BLIT_FLIP_Y = 0x0001u,
+};
+
+enum {
+    MYAOS_INPUT_KEYBOARD_KEYS = 256u,
+};
+
+enum {
+    MYAOS_INPUT_KEY_EVENT_PRESS = 1u,
+    MYAOS_INPUT_KEY_EVENT_RELEASE = 2u,
+    MYAOS_INPUT_KEY_EVENT_REPEAT = 3u,
+};
+
+enum {
+    MYAOS_INPUT_MOD_SHIFT = 0x0001u,
+    MYAOS_INPUT_MOD_CTRL = 0x0002u,
+    MYAOS_INPUT_MOD_ALT = 0x0004u,
+    MYAOS_INPUT_MOD_GUI = 0x0008u,
+};
+
+enum {
+    MYAOS_EVENT_INPUT_KEYBOARD = 0x00010000u,
+};
 
 enum {
     MYAOS_SYS_CONSOLE_WRITE = 1,
@@ -256,6 +384,35 @@ enum {
     MYAOS_SYS_SOCK_SEND_TO = 89,
     MYAOS_SYS_SOCK_RECV_FROM = 90,
     MYAOS_SYS_NET_SEND_UDP4 = 91,
+    MYAOS_SYS_POSIX_OPEN = 92,
+    MYAOS_SYS_POSIX_CLOSE = 93,
+    MYAOS_SYS_POSIX_READ = 94,
+    MYAOS_SYS_POSIX_WRITE = 95,
+    MYAOS_SYS_POSIX_LSEEK = 96,
+    MYAOS_SYS_POSIX_FSTAT = 97,
+    MYAOS_SYS_POSIX_DUP2 = 98,
+    MYAOS_SYS_POSIX_POLL = 99,
+    MYAOS_SYS_FS_CHMOD = 100,
+    MYAOS_SYS_FS_CHOWN = 101,
+    MYAOS_SYS_SOCK_CONNECT4 = 102,
+    MYAOS_SYS_NET_PING4 = 103,
+    MYAOS_SYS_FB_PREF_SET = 104,
+    MYAOS_SYS_FB_PREF_GET = 105,
+    MYAOS_SYS_GFX_MODE_SET = 106,
+    MYAOS_SYS_GFX_MODE_GET = 107,
+    MYAOS_SYS_GFX_INFO_GET = 108,
+    MYAOS_SYS_GFX_DRAW = 109,
+    MYAOS_SYS_GFX_DRAW_BATCH = 110,
+    MYAOS_SYS_GFX_BLIT = 111,
+    MYAOS_SYS_INPUT_KEY_STATE = 112,
+    MYAOS_SYS_INPUT_KEYBOARD_STATE = 113,
+    MYAOS_SYS_INPUT_KEY_EVENT_READ = 114,
+    MYAOS_SYS_GFX_PRESENT = 115,
+    MYAOS_SYS_TIME_TICKS = 116,
+    MYAOS_SYS_TIME_FREQ = 117,
+    MYAOS_SYS_INPUT_WAIT = 118,
+    MYAOS_SYS_EVENT_POLL = 119,
+    MYAOS_SYS_MOD_LOAD_FILE = 120,
 };
 
 #endif

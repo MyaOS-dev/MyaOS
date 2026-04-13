@@ -3,11 +3,14 @@
 #include "vfs.h"
 #include <stdint.h>
 
-#define ELF_MAX_FILE_SIZE (256u * 1024u)
+#define ELF_MAX_FILE_SIZE (32u * 1024u * 1024u)
 #define PT_LOAD 1u
+#define PT_INTERP 3u
+#define PT_PHDR 6u
 #define ET_EXEC 2u
 #define ET_DYN 3u
 #define EM_X86_64 62u
+#define ELF_LIST_SCAN_MAX 256u
 
 typedef unsigned char Elf64_Byte;
 typedef uint16_t Elf64_Half;
@@ -66,14 +69,112 @@ static void mem_copy(void* dst, const void* src, uint64_t size) {
     }
 }
 
+static int str_eq(const char* a, const char* b) {
+    uint32_t i = 0u;
+
+    if (!a || !b) {
+        return 0;
+    }
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) {
+            return 0;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static int split_abs_parent_leaf(
+    const char* abs_path,
+    char* out_parent,
+    uint32_t parent_size,
+    char* out_leaf,
+    uint32_t leaf_size
+) {
+    uint32_t len = 0u;
+    uint32_t last_slash = 0u;
+
+    if (!abs_path || abs_path[0] != '/' || !out_parent || !out_leaf || parent_size == 0u || leaf_size == 0u) {
+        return -1;
+    }
+
+    while (abs_path[len] != '\0') {
+        if (abs_path[len] == '/') {
+            last_slash = len;
+        }
+        len++;
+        if (len >= MYAOS_PATH_MAX) {
+            return -1;
+        }
+    }
+    if (len == 0u || last_slash + 1u >= len) {
+        return -1;
+    }
+
+    if (last_slash == 0u) {
+        if (parent_size < 2u) {
+            return -1;
+        }
+        out_parent[0] = '/';
+        out_parent[1] = '\0';
+    } else {
+        if (last_slash + 1u > parent_size) {
+            return -1;
+        }
+        mem_copy(out_parent, abs_path, last_slash);
+        out_parent[last_slash] = '\0';
+    }
+
+    {
+        uint32_t leaf_len = len - (last_slash + 1u);
+        if (leaf_len == 0u || leaf_len + 1u > leaf_size) {
+            return -1;
+        }
+        mem_copy(out_leaf, abs_path + last_slash + 1u, leaf_len);
+        out_leaf[leaf_len] = '\0';
+    }
+
+    return 0;
+}
+
+static int vfs_probe_file_size(const char* cwd, const char* path, uint32_t* out_size) {
+    char abs_path[MYAOS_PATH_MAX];
+    char parent_path[MYAOS_PATH_MAX];
+    char leaf_name[MYAOS_NAME_MAX];
+    myaos_dirent_t entries[ELF_LIST_SCAN_MAX];
+    size_t count = 0u;
+
+    if (!path || !out_size) {
+        return -1;
+    }
+    if (vfs_resolve_cwd(cwd, path, abs_path, sizeof(abs_path)) != 0) {
+        return -1;
+    }
+    if (split_abs_parent_leaf(abs_path, parent_path, sizeof(parent_path), leaf_name, sizeof(leaf_name)) != 0) {
+        return -1;
+    }
+    if (vfs_list("/", parent_path, entries, ELF_LIST_SCAN_MAX, &count) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].type == MYAOS_NODE_FILE && str_eq(entries[i].name, leaf_name)) {
+            *out_size = entries[i].size;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 int elf_load_from_vfs(const char* cwd, const char* path, elf_image_t* out) {
     uint8_t* file_buf;
     uint32_t file_size = 0;
+    uint32_t file_cap = 0;
     Elf64_Ehdr* ehdr;
     Elf64_Phdr* phdrs;
     uint64_t ph_table_size;
     uint64_t min_vaddr = ~0ULL;
     uint64_t max_vaddr = 0;
+    uint64_t phdr_vaddr = 0u;
     uint8_t* image;
     uint64_t image_size;
 
@@ -84,13 +185,26 @@ int elf_load_from_vfs(const char* cwd, const char* path, elf_image_t* out) {
     out->load_base = NULL;
     out->load_size = 0;
     out->entry = NULL;
+    out->vaddr_base = 0u;
+    out->entry_vaddr = 0u;
+    out->phdr_vaddr = 0u;
+    out->phentsize = 0u;
+    out->phnum = 0u;
+    out->interp[0] = '\0';
 
-    file_buf = (uint8_t*)kmalloc(ELF_MAX_FILE_SIZE);
+    if (vfs_probe_file_size(cwd, path, &file_cap) != 0) {
+        return -1;
+    }
+    if (file_cap == 0u || file_cap > ELF_MAX_FILE_SIZE) {
+        return -1;
+    }
+
+    file_buf = (uint8_t*)kmalloc(file_cap);
     if (!file_buf) {
         return -1;
     }
 
-    if (vfs_read_file(cwd, path, file_buf, ELF_MAX_FILE_SIZE, &file_size) != 0) {
+    if (vfs_read_file(cwd, path, file_buf, file_cap, &file_size) != 0) {
         kfree(file_buf);
         return -1;
     }
@@ -124,6 +238,24 @@ int elf_load_from_vfs(const char* cwd, const char* path, elf_image_t* out) {
 
     phdrs = (Elf64_Phdr*)(void*)(file_buf + ehdr->e_phoff);
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_INTERP) {
+            uint64_t interp_len = phdrs[i].p_filesz;
+            if (interp_len == 0u || phdrs[i].p_offset > file_size || interp_len > (uint64_t)file_size - phdrs[i].p_offset) {
+                kfree(file_buf);
+                return -1;
+            }
+            if (interp_len >= MYAOS_PATH_MAX) {
+                interp_len = MYAOS_PATH_MAX - 1u;
+            }
+            mem_copy(out->interp, file_buf + phdrs[i].p_offset, interp_len);
+            out->interp[interp_len] = '\0';
+            if (out->interp[0] == '\0') {
+                kfree(file_buf);
+                return -1;
+            }
+        } else if (phdrs[i].p_type == PT_PHDR && phdrs[i].p_memsz >= (uint64_t)ehdr->e_phnum * (uint64_t)sizeof(Elf64_Phdr)) {
+            phdr_vaddr = phdrs[i].p_vaddr;
+        }
         if (phdrs[i].p_type != PT_LOAD) {
             continue;
         }
@@ -147,6 +279,12 @@ int elf_load_from_vfs(const char* cwd, const char* path, elf_image_t* out) {
         }
         if (phdrs[i].p_vaddr + phdrs[i].p_memsz > max_vaddr) {
             max_vaddr = phdrs[i].p_vaddr + phdrs[i].p_memsz;
+        }
+        if (phdr_vaddr == 0u) {
+            uint64_t phoff = (uint64_t)ehdr->e_phoff;
+            if (phoff >= phdrs[i].p_offset && phoff + ph_table_size <= phdrs[i].p_offset + phdrs[i].p_filesz) {
+                phdr_vaddr = phdrs[i].p_vaddr + (phoff - phdrs[i].p_offset);
+            }
         }
     }
 
@@ -184,6 +322,11 @@ int elf_load_from_vfs(const char* cwd, const char* path, elf_image_t* out) {
     out->load_base = image;
     out->load_size = image_size;
     out->entry = (elf_entry_t)(uintptr_t)(image + (ehdr->e_entry - min_vaddr));
+    out->vaddr_base = min_vaddr;
+    out->entry_vaddr = ehdr->e_entry;
+    out->phdr_vaddr = phdr_vaddr;
+    out->phentsize = ehdr->e_phentsize;
+    out->phnum = ehdr->e_phnum;
 
     kfree(file_buf);
     return 0;
@@ -201,4 +344,10 @@ void elf_unload(elf_image_t* image) {
     image->load_base = NULL;
     image->load_size = 0;
     image->entry = NULL;
+    image->vaddr_base = 0u;
+    image->entry_vaddr = 0u;
+    image->phdr_vaddr = 0u;
+    image->phentsize = 0u;
+    image->phnum = 0u;
+    image->interp[0] = '\0';
 }

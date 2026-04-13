@@ -1,5 +1,8 @@
 # Architecture
 
+MyaOS is an independent kernel/userspace design (not Unix-based).  
+Unix-like command names (`ls`, `cat`, `sh`, etc.) are legacy compatibility aliases over MyaOS-native syscalls and tools.
+
 ## Kernel Layout
 
 - `kernel/arch/x86_64`: interrupt stubs, IDT setup, low-level entry
@@ -9,6 +12,7 @@
 - `kernel/fs`: FAT32, ext2/3/4, RAMFS, VFS, and filesystem driver/probe logic
 - `kernel/dev`: device registry plus timer, keyboard, block I/O, and power drivers
 - `kernel/core/module.*`: runtime kernel module registry for optional components
+- `kernel/modules`: loadable kernel module implementations (embedded descriptors + load/unload hooks)
 - `kernel/proc`: process-aware scheduler and ELF loader
 - `kernel/net`: loopback IP/UDP-like stack and socket table
 - `kernel/gfx`: framebuffer graphics and font code

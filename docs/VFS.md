@@ -29,10 +29,9 @@ Mounted VFS backends:
 - `ext2`
 - `ext3`
 - `ext4`
+- `ntfs`
 - `ramfs`
 - `myafs`
-
-`ntfs` remains detection-only.
 
 `ext*` write behavior is gated by internal safety level:
 
@@ -54,8 +53,12 @@ Mounted VFS backends:
 - global sync
 - attachment enumeration
 
-## Shell Impact
+## Runtime Writeback Note
 
-The shell no longer talks to FAT32 or RAMFS directly.
+Firmware-loaded block images are copied into RAM before the kernel takes over. After `ExitBootServices`, filesystem writes can still update that runtime image, but flushing changes back through UEFI Block I/O is not guaranteed.
 
-It uses VFS paths and command manifests in `/cmd` with `/boot/cmd` fallback. Command binaries are loaded from `/bin` with `/boot/bin` fallback.
+Current consequence:
+
+- `fat32`, `ext*`, and `ntfs` writes work during the active session
+- persistence back to the original firmware-backed disk image is not guaranteed yet
+- `ramfs` and `myafs` are unaffected because they do not depend on UEFI Block I/O writeback

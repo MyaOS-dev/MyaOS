@@ -3,6 +3,7 @@
 #include "gdt.h"
 #include "init.h"
 #include "interrupts.h"
+#include "log.h"
 #include "module.h"
 #include "shell.h"
 #include "syscall.h"
@@ -28,12 +29,20 @@
 #include <stdint.h>
 
 #define KERNEL_TIMER_HZ 250u
+#define KERNEL_BOOT_MENU_TIMEOUT_TICKS (KERNEL_TIMER_HZ * 3u)
+#define KERNEL_BOOT_MENU_FALLBACK_SPINS 2000000ull
+#define KERNEL_BOOT_LOG_MAX (16u * 1024u)
+#define KERNEL_BOOT_CURRENT_LOG "/var/log/boot.current.log"
+#define KERNEL_BOOT_LAST_LOG "/var/log/boot.last.log"
 
 extern char _kernel_start;
 extern char _kernel_end;
 
 static vfs_fat32_t g_boot_fs;
 static vfs_ramfs_t g_ram_fs;
+static vfs_ramfs_t g_home_fs;
+static vfs_ramfs_t g_tmp_fs;
+static vfs_ramfs_t g_run_fs;
 static vfs_myafs_t g_mya_fs;
 static vfs_sysview_t g_dvc_view;
 static vfs_sysview_t g_prc_view;
@@ -206,6 +215,16 @@ static void kernel_mount_filesystems(boot_info_t* boot) {
     (void)vfs_mount("/ram", "ramfs", "ramfs", MYAOS_INVALID_DISK_ID, 0, &g_ram_fs, vfs_ramfs_ops());
     (void)vfs_write_file("/", "/ram/welcome.txt", (const uint8_t*)"this file lives in ramfs", 24u);
 
+    vfs_ramfs_init(&g_home_fs);
+    (void)vfs_mount("/home", "ramfs", "homefs", MYAOS_INVALID_DISK_ID, 0, &g_home_fs, vfs_ramfs_ops());
+    (void)vfs_write_file("/", "/home/readme.txt", (const uint8_t*)"home is isolated from system root", 33u);
+
+    vfs_ramfs_init(&g_tmp_fs);
+    (void)vfs_mount("/tmp", "ramfs", "tmpfs", MYAOS_INVALID_DISK_ID, 0, &g_tmp_fs, vfs_ramfs_ops());
+
+    vfs_ramfs_init(&g_run_fs);
+    (void)vfs_mount("/run", "ramfs", "runfs", MYAOS_INVALID_DISK_ID, 0, &g_run_fs, vfs_ramfs_ops());
+
     vfs_sysview_init(&g_dvc_view, VFS_SYSVIEW_KIND_DEVICES);
     (void)vfs_mount("/dvc", "sysview", "devices", MYAOS_INVALID_DISK_ID, 1, &g_dvc_view, vfs_sysview_ops());
     (void)vfs_mount("/dev", "sysview", "devices", MYAOS_INVALID_DISK_ID, 1, &g_dvc_view, vfs_sysview_ops());
@@ -215,6 +234,59 @@ static void kernel_mount_filesystems(boot_info_t* boot) {
     vfs_sysview_init(&g_cfg_view, VFS_SYSVIEW_KIND_CONFIG);
     (void)vfs_mount("/cfg", "sysview", "config", MYAOS_INVALID_DISK_ID, 1, &g_cfg_view, vfs_sysview_ops());
     (void)vfs_mount("/sys", "sysview", "config", MYAOS_INVALID_DISK_ID, 1, &g_cfg_view, vfs_sysview_ops());
+}
+
+static uint8_t kernel_boot_select_recovery(void) {
+    uint64_t start_tick = timer_ticks();
+    uint64_t fallback_spins = 0ull;
+
+    console_write("\nboot menu: [Enter] normal, [R] recovery (auto in 3s)\n");
+    console_write("choice> ");
+    for (;;) {
+        char c = keyboard_read_char();
+        uint64_t now = timer_ticks();
+
+        if (c == 0) {
+            if (now > start_tick) {
+                if (now - start_tick >= KERNEL_BOOT_MENU_TIMEOUT_TICKS) {
+                    break;
+                }
+            } else {
+                fallback_spins++;
+                if (fallback_spins >= KERNEL_BOOT_MENU_FALLBACK_SPINS) {
+                    break;
+                }
+            }
+        } else {
+            if (c == 'r' || c == 'R') {
+                console_write("recovery\n");
+                return 1u;
+            }
+            if (c == '\n' || c == '\r' || c == ' ') {
+                break;
+            }
+        }
+    }
+
+    console_write("normal\n");
+    return 0u;
+}
+
+static void kernel_persist_boot_logs(void) {
+    static uint8_t prev[KERNEL_BOOT_LOG_MAX];
+    static char snap[KERNEL_BOOT_LOG_MAX];
+    uint32_t prev_size = 0u;
+    uint32_t snap_size = 0u;
+
+    (void)vfs_mkdir("/", "/var");
+    (void)vfs_mkdir("/", "/var/log");
+
+    if (vfs_read_file("/", KERNEL_BOOT_CURRENT_LOG, prev, sizeof(prev), &prev_size) == 0) {
+        (void)vfs_write_file("/", KERNEL_BOOT_LAST_LOG, prev, prev_size);
+    }
+    if (klog_snapshot(snap, sizeof(snap), &snap_size) == 0) {
+        (void)vfs_write_file("/", KERNEL_BOOT_CURRENT_LOG, (const uint8_t*)snap, snap_size);
+    }
 }
 
 static int init_step_pmm(boot_info_t* boot) {
@@ -328,8 +400,8 @@ static const kernel_init_step_t g_kernel_init_steps[] = {
     { "power", init_step_power },
     { "keyboard", init_step_keyboard },
     { "blockio", init_step_blockio },
-    { "network", init_step_network },
     { "modules", init_step_modules },
+    { "network", init_step_network },
     { "vfs", init_step_vfs },
     { "shell", init_step_shell },
     { "syscall", init_step_syscall },
@@ -345,6 +417,7 @@ void kernel_main(boot_info_t* boot) {
     int32_t idle_pid = -1;
     int shell_rc;
     int idle_rc;
+    uint8_t recovery_mode = 0u;
 
     dbg_putc('i');
     if (kernel_init_run(boot, g_kernel_init_steps, KERNEL_INIT_STEP_COUNT) != 0) {
@@ -352,6 +425,10 @@ void kernel_main(boot_info_t* boot) {
         panic_message(kernel_init_failed_step()[0] ? kernel_init_failed_step() : "kernel init failed");
     }
     dbg_putc('j');
+
+    recovery_mode = kernel_boot_select_recovery();
+    shell_set_recovery_mode(recovery_mode);
+    kernel_persist_boot_logs();
 
     shell_rc = scheduler_spawn_kernel("shell", shell_main, 0, NULL, 0, &shell_pid);
     idle_rc = scheduler_spawn_kernel("idle", shell_idle_main, 0, NULL, 1, &idle_pid);

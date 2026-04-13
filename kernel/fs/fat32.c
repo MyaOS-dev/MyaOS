@@ -25,6 +25,25 @@ static size_t str_len(const char* s) {
     return n;
 }
 
+static void str_copy(char* dst, const char* src, size_t dst_size) {
+    size_t i = 0;
+
+    if (!dst || dst_size == 0u) {
+        return;
+    }
+
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    while (src[i] && i + 1u < dst_size) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static void mem_zero(void* dst, size_t size) {
     uint8_t* out = (uint8_t*)dst;
     for (size_t i = 0; i < size; i++) {
@@ -92,7 +111,7 @@ static int valid_short_char(char c) {
     if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
         return 1;
     }
-    return c == '_' || c == '-';
+    return c == '_' || c == '-' || c == '~';
 }
 
 static int build_short_name(const char* name, uint8_t out[11]) {
@@ -188,8 +207,90 @@ static void format_short_name(const uint8_t* entry, char out[FAT32_NAME_MAX]) {
     out[pos] = '\0';
 }
 
-static void read_entry_to_dirent(const uint8_t* entry, fat32_dirent_t* out) {
-    format_short_name(entry, out->name);
+typedef struct {
+    uint8_t valid;
+    uint8_t expected_seq;
+    char name[FAT32_NAME_MAX];
+} fat32_lfn_state_t;
+
+static void fat32_lfn_reset(fat32_lfn_state_t* lfn) {
+    if (!lfn) {
+        return;
+    }
+    lfn->valid = 0u;
+    lfn->expected_seq = 0u;
+    mem_zero(lfn->name, sizeof(lfn->name));
+}
+
+static void fat32_lfn_decode_entry(const uint8_t* entry, char* out, size_t out_cap, uint32_t base_index) {
+    static const uint8_t pos[13] = {1u, 3u, 5u, 7u, 9u, 14u, 16u, 18u, 20u, 22u, 24u, 28u, 30u};
+
+    if (!entry || !out || out_cap == 0u) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < 13u; i++) {
+        uint32_t idx = base_index + i;
+        uint16_t ch = rd16(entry + pos[i]);
+
+        if (idx + 1u >= out_cap) {
+            continue;
+        }
+        if (ch == 0x0000u || ch == 0xFFFFu) {
+            out[idx] = '\0';
+            return;
+        }
+        out[idx] = (ch <= 0x7Fu) ? (char)ch : '?';
+    }
+}
+
+static void fat32_lfn_push(fat32_lfn_state_t* lfn, const uint8_t* entry) {
+    uint8_t seq;
+    uint8_t is_last;
+
+    if (!lfn || !entry) {
+        return;
+    }
+
+    seq = entry[0] & 0x1Fu;
+    is_last = (entry[0] & 0x40u) ? 1u : 0u;
+    if (seq == 0u || seq > 20u) {
+        fat32_lfn_reset(lfn);
+        return;
+    }
+
+    if (is_last) {
+        lfn->valid = 1u;
+        lfn->expected_seq = seq;
+        mem_zero(lfn->name, sizeof(lfn->name));
+    }
+
+    if (!lfn->valid || lfn->expected_seq != seq) {
+        fat32_lfn_reset(lfn);
+        return;
+    }
+
+    fat32_lfn_decode_entry(entry, lfn->name, sizeof(lfn->name), (uint32_t)(seq - 1u) * 13u);
+    if (seq == 1u) {
+        lfn->expected_seq = 0u;
+    } else {
+        lfn->expected_seq = (uint8_t)(seq - 1u);
+    }
+}
+
+static uint8_t fat32_lfn_ready(const fat32_lfn_state_t* lfn) {
+    if (!lfn || !lfn->valid || lfn->expected_seq != 0u || lfn->name[0] == '\0') {
+        return 0u;
+    }
+    return 1u;
+}
+
+static void read_entry_to_dirent(const uint8_t* entry, const char* resolved_name, fat32_dirent_t* out) {
+    if (resolved_name && resolved_name[0]) {
+        str_copy(out->name, resolved_name, sizeof(out->name));
+    } else {
+        format_short_name(entry, out->name);
+    }
     out->is_dir = (entry[11] & FAT32_ATTR_DIR) ? 1u : 0u;
     out->first_cluster = ((uint32_t)rd16(&entry[20]) << 16) | (uint32_t)rd16(&entry[26]);
     out->size = rd32(&entry[28]);
@@ -341,9 +442,10 @@ static int find_entry_in_dir(
     uint32_t* out_off
 ) {
     uint8_t short_name[11];
-    if (build_short_name(name, short_name) != 0) {
-        return -1;
-    }
+    uint8_t have_short_name = (build_short_name(name, short_name) == 0) ? 1u : 0u;
+    fat32_lfn_state_t lfn;
+
+    fat32_lfn_reset(&lfn);
 
     if (dir_cluster < 2) {
         dir_cluster = fs->root_cluster;
@@ -366,28 +468,53 @@ static int find_entry_in_dir(
                 if (entry[0] == 0x00) {
                     return -2;
                 }
-                if (entry[0] == 0xE5 || entry[11] == FAT32_ATTR_LFN) {
+                if (entry[0] == 0xE5) {
+                    fat32_lfn_reset(&lfn);
+                    continue;
+                }
+                if (entry[11] == FAT32_ATTR_LFN) {
+                    fat32_lfn_push(&lfn, entry);
+                    continue;
+                }
+                if (entry[11] & 0x08u) {
+                    fat32_lfn_reset(&lfn);
                     continue;
                 }
 
-                uint8_t same = 1;
-                for (uint32_t i = 0; i < 11; i++) {
-                    if (entry[i] != short_name[i]) {
-                        same = 0;
-                        break;
-                    }
-                }
+                {
+                    uint8_t same_short = 0u;
+                    char short_entry_name[FAT32_NAME_MAX];
+                    const char* entry_name = NULL;
 
-                if (same) {
-                    mem_copy(out_entry, entry, 32);
-                    if (out_sector) {
-                        *out_sector = first_sector + s;
+                    if (have_short_name) {
+                        same_short = 1u;
+                        for (uint32_t i = 0; i < 11u; i++) {
+                            if (entry[i] != short_name[i]) {
+                                same_short = 0u;
+                                break;
+                            }
+                        }
                     }
-                    if (out_off) {
-                        *out_off = off;
+
+                    if (fat32_lfn_ready(&lfn)) {
+                        entry_name = lfn.name;
+                    } else {
+                        format_short_name(entry, short_entry_name);
+                        entry_name = short_entry_name;
                     }
-                    return 0;
+
+                    if (same_short || str_eq_ci(entry_name, name)) {
+                        mem_copy(out_entry, entry, 32);
+                        if (out_sector) {
+                            *out_sector = first_sector + s;
+                        }
+                        if (out_off) {
+                            *out_off = off;
+                        }
+                        return 0;
+                    }
                 }
+                fat32_lfn_reset(&lfn);
             }
         }
 
@@ -681,6 +808,8 @@ int fat32_list_dir(
     size_t count = 0;
     uint32_t cluster = dir_cluster;
     uint32_t guard = 0;
+    fat32_lfn_state_t lfn;
+    fat32_lfn_reset(&lfn);
 
     while (cluster >= 2 && cluster < FAT32_CLUSTER_END && guard < 8192) {
         uint32_t first_sector = cluster_to_sector(fs, cluster);
@@ -697,10 +826,16 @@ int fat32_list_dir(
                     *out_count = count;
                     return 0;
                 }
-                if (entry[0] == 0xE5 || entry[11] == FAT32_ATTR_LFN) {
+                if (entry[0] == 0xE5) {
+                    fat32_lfn_reset(&lfn);
+                    continue;
+                }
+                if (entry[11] == FAT32_ATTR_LFN) {
+                    fat32_lfn_push(&lfn, entry);
                     continue;
                 }
                 if (entry[11] & 0x08u) {
+                    fat32_lfn_reset(&lfn);
                     continue;
                 }
                 if (count >= max_entries) {
@@ -708,8 +843,15 @@ int fat32_list_dir(
                     return -2;
                 }
 
-                read_entry_to_dirent(entry, &entries[count]);
+                if (fat32_lfn_ready(&lfn)) {
+                    read_entry_to_dirent(entry, lfn.name, &entries[count]);
+                } else {
+                    char short_entry_name[FAT32_NAME_MAX];
+                    format_short_name(entry, short_entry_name);
+                    read_entry_to_dirent(entry, short_entry_name, &entries[count]);
+                }
                 count++;
+                fat32_lfn_reset(&lfn);
             }
         }
 
@@ -737,7 +879,7 @@ int fat32_lookup(
         return rc;
     }
 
-    read_entry_to_dirent(entry, out);
+    read_entry_to_dirent(entry, name, out);
     return 0;
 }
 

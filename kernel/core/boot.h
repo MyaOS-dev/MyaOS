@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #define BOOT_MAX_DISKS 4u
+#define BOOT_MAX_FB_MODES 32u
 
 typedef struct {
     uint64_t base;
@@ -26,6 +27,14 @@ typedef struct {
 } boot_disk_info_t;
 
 typedef struct {
+    uint32_t mode;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixels_per_scanline;
+    uint32_t format;
+} boot_fb_mode_t;
+
+typedef struct {
     framebuffer_t fb;
     uint64_t mmap;
     uint64_t mmap_size;
@@ -33,6 +42,9 @@ typedef struct {
     uint64_t boot_disk_base;
     uint64_t boot_disk_size;
     uint64_t efi_reset_system;
+    uint64_t efi_get_variable;
+    uint64_t efi_set_variable;
+    uint64_t acpi_rsdp;
     uint64_t efi_block_io;
     uint64_t boot_disk_lba_start;
     uint64_t boot_disk_block_count;
@@ -41,7 +53,12 @@ typedef struct {
     uint32_t boot_disk_read_only;
     uint32_t boot_services_active;
     uint32_t disk_count;
+    uint32_t acpi_revision;
+    uint32_t fb_mode;
+    uint32_t fb_mode_count;
+    uint32_t fb_mode_total;
     uint32_t reserved0;
     boot_disk_info_t disks[BOOT_MAX_DISKS];
+    boot_fb_mode_t fb_modes[BOOT_MAX_FB_MODES];
 } boot_info_t;
 #endif

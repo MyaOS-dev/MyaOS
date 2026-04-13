@@ -1,6 +1,6 @@
 #include "../lib/myaos.h"
 
-#define FBINFO_VALUE_MAX 64u
+#define FBINFO_VALUE_MAX 2048u
 
 static int read_key(const char* key) {
     char path[MYAOS_PATH_MAX];
@@ -40,5 +40,9 @@ int program_main(int argc, char** argv) {
     (void)read_key("fb_stride");
     (void)read_key("fb_format");
     (void)read_key("fb_size");
+    (void)read_key("fb_mode");
+    (void)read_key("fb_mode_count");
+    (void)read_key("fb_mode_total");
+    (void)read_key("fb_modes");
     return 0;
 }

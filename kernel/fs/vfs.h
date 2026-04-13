@@ -36,6 +36,8 @@ int vfs_touch(const char* cwd, const char* path);
 int vfs_remove(const char* cwd, const char* path);
 int vfs_is_dir(const char* cwd, const char* path);
 int vfs_can_exec(const char* cwd, const char* path);
+int vfs_chmod(const char* cwd, const char* path, uint16_t mode);
+int vfs_chown(const char* cwd, const char* path, uint32_t owner_uid);
 int vfs_resolve_cwd(const char* cwd, const char* path, char* out_abs_path, size_t out_size);
 int vfs_sync_all(void);
 int vfs_list_mounts(myaos_mount_info_t* out, uint32_t max_entries, uint32_t* out_count);
