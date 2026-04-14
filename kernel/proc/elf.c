@@ -69,14 +69,21 @@ static void mem_copy(void* dst, const void* src, uint64_t size) {
     }
 }
 
-static int str_eq(const char* a, const char* b) {
+static char to_upper_ascii(char c) {
+    if (c >= 'a' && c <= 'z') {
+        return (char)(c - ('a' - 'A'));
+    }
+    return c;
+}
+
+static int str_eq_ci(const char* a, const char* b) {
     uint32_t i = 0u;
 
     if (!a || !b) {
         return 0;
     }
     while (a[i] && b[i]) {
-        if (a[i] != b[i]) {
+        if (to_upper_ascii(a[i]) != to_upper_ascii(b[i])) {
             return 0;
         }
         i++;
@@ -157,7 +164,7 @@ static int vfs_probe_file_size(const char* cwd, const char* path, uint32_t* out_
         return -1;
     }
     for (size_t i = 0; i < count; i++) {
-        if (entries[i].type == MYAOS_NODE_FILE && str_eq(entries[i].name, leaf_name)) {
+        if (entries[i].type == MYAOS_NODE_FILE && str_eq_ci(entries[i].name, leaf_name)) {
             *out_size = entries[i].size;
             return 0;
         }
