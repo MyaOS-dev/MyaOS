@@ -1,4 +1,5 @@
 #include "timer.h"
+#include "apic.h"
 #include "device.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -13,7 +14,7 @@ static inline void out8(uint16_t port, uint8_t value) {
     __asm__ __volatile__("outb %0, %1" : : "a"(value), "Nd"(port));
 }
 
-void timer_init(uint32_t hz) {
+static void timer_program_pit(uint32_t hz) {
     if (hz == 0) {
         hz = 100u;
     }
@@ -37,6 +38,25 @@ void timer_init(uint32_t hz) {
     out8(0x43u, 0x36u);
     out8(0x40u, (uint8_t)(divisor & 0xFFu));
     out8(0x40u, (uint8_t)((divisor >> 8) & 0xFFu));
+}
+
+void timer_init(uint32_t hz) {
+    if (apic_is_enabled()) {
+        uint32_t actual_hz = 0u;
+
+        if (apic_timer_start(hz, 32u, &actual_hz) == 0) {
+            g_timer_hz = (actual_hz != 0u) ? actual_hz : 1u;
+            if (!g_timer_registered && device_register(MYAOS_DEV_TIMER, "lapic0", "xapic.timer", NULL, NULL, NULL) == 0) {
+                g_timer_registered = 1;
+            }
+            return;
+        }
+
+        (void)ioapic_route_irq(2u, 32u, 0u);
+        (void)ioapic_route_irq(0u, 32u, 0u);
+    }
+
+    timer_program_pit(hz);
 
     if (!g_timer_registered && device_register(MYAOS_DEV_TIMER, "pit0", "i8253", NULL, NULL, NULL) == 0) {
         g_timer_registered = 1;

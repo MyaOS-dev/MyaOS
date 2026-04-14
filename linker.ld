@@ -9,6 +9,10 @@ SECTIONS
     .rodata : ALIGN(4K) {
         *(.rodata*)
         *(.lrodata*)
+        . = ALIGN(8);
+        __myaos_kmods_start = .;
+        KEEP(*(.myaos_kmods))
+        __myaos_kmods_end = .;
     }
     .data : ALIGN(4K) {
         *(.data*)

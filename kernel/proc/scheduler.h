@@ -51,6 +51,7 @@ uint32_t scheduler_process_count(void);
 int32_t scheduler_current_pid(void);
 int scheduler_list_processes(myaos_proc_info_t* out, uint32_t max_entries, uint32_t* out_count);
 int scheduler_notify(int32_t pid, uint32_t bits);
+void scheduler_notify_all(uint32_t bits);
 int scheduler_notify_poll(uint32_t mask, uint8_t clear, uint32_t* out_bits);
 int scheduler_notify_wait(uint32_t mask, uint32_t timeout_ticks, uint8_t clear, uint32_t* out_bits);
 int scheduler_ipc_send(int32_t pid, const char* data, uint32_t len);
@@ -59,6 +60,14 @@ int scheduler_pipe_create(int32_t* out_read_fd, int32_t* out_write_fd);
 int scheduler_pipe_close(int32_t fd);
 int scheduler_pipe_read(int32_t fd, void* out_buf, uint32_t max_len, uint32_t* out_read);
 int scheduler_pipe_write(int32_t fd, const void* data, uint32_t len, uint32_t* out_written);
+int scheduler_posix_open(const char* path, uint32_t flags, int32_t* out_fd);
+int scheduler_posix_close(int32_t fd);
+int scheduler_posix_read(int32_t fd, void* out_buf, uint32_t max_len, uint32_t* out_read);
+int scheduler_posix_write(int32_t fd, const void* data, uint32_t len, uint32_t* out_written);
+int scheduler_posix_lseek(int32_t fd, int64_t offset, uint32_t whence, uint64_t* out_offset);
+int scheduler_posix_fstat(int32_t fd, myaos_posix_stat_t* out);
+int scheduler_posix_dup2(int32_t old_fd, int32_t new_fd);
+int scheduler_posix_poll(myaos_posix_pollfd_t* fds, uint32_t count, uint32_t timeout_ticks, uint32_t* out_ready);
 int scheduler_thread_create_current(uint64_t entry, uint64_t arg, uint64_t stack_top, int32_t* out_tid);
 int scheduler_thread_join_current(int32_t tid, int32_t* exit_code);
 int scheduler_thread_join_poll_current(int32_t tid, int32_t* exit_code);
@@ -82,5 +91,20 @@ int scheduler_current_user_region(uint64_t* out_base, uint64_t* out_end);
 const char* scheduler_current_cwd(void);
 int scheduler_setcwd_current(const char* abs_path);
 int scheduler_getcwd_current(char* out, size_t out_size);
+int scheduler_current_linux_compat(void);
+int scheduler_linux_brk(uint64_t requested, uint64_t* out_brk);
+int scheduler_linux_fs_base_set(uint64_t fs_base);
+int scheduler_linux_fs_base_get(uint64_t* out_fs_base);
+int scheduler_linux_clone_current(
+    uint64_t frame_rsp,
+    uint64_t flags,
+    uint64_t child_stack,
+    int32_t* parent_tid_ptr,
+    int32_t* child_tid_ptr,
+    uint64_t tls,
+    int32_t* out_tid
+);
+int scheduler_proc_name_set_current(const char* name);
+int scheduler_proc_name_get_current(char* out, size_t out_size);
 
 #endif

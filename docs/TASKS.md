@@ -1,167 +1,174 @@
-# MyaOS Task Backlog
-
-Это master-чеклист задач, собранный из вашего списка требований.
+# Terminal-Friendly OS Task Backlog 
 
 Легенда статусов:
-- `[x]` done
-- `[~]` partial / basic implementation
-- `[ ]` not implemented
-- `[!]` unstable / needs redesign
-- `[t]` needs testing
-- `[d]` documented but not verified
+
+* `[x]` done
+* `[~]` partial
+* `[ ]` not implemented
+* `[!]` unstable
+* `[t]` needs testing
+* `[d]` documented
 
 Легенда приоритетов:
-- `P0` — критический фундамент
-- `P1` — ядро системы
-- `P2` — важные расширения
-- `P3` — долгосрочные/опциональные
 
-## 1) System Architecture
-- `[x]` `ARCH-001 (P0)` Clean kernel architecture
-- `[x]` `ARCH-002 (P0)` Clear separation between kernel space and user space
-- `[x]` `ARCH-003 (P0)` Well-designed subsystem boundaries (memory, process, filesystem, devices)
-- `[x]` `ARCH-004 (P0)` Stable internal interfaces between kernel subsystems
+* `P0` — критический фундамент
+* `P1` — ядро UX
+* `P2` — важные улучшения
+* `P3` — опционально
 
-## 2) Boot and Initialization
-- `[x]` `BOOT-001 (P0)` Reliable boot process (UEFI)
-- `[x]` `BOOT-002 (P0)` Bootloader -> kernel handoff
-- `[x]` `BOOT-003 (P0)` Hardware initialization
-- `[x]` `BOOT-004 (P1)` System initialization framework
+---
 
-## 3) Process and Task Management
-- `[x]` `PROC-001 (P0)` Process creation and termination
-- `[x]` `PROC-002 (P0)` Process isolation
-- `[x]` `PROC-003 (P0)` Multitasking
-- `[x]` `PROC-004 (P1)` Thread support
-- `[x]` `PROC-005 (P0)` Efficient scheduler
-- `[x]` `PROC-006 (P1)` Priority scheduling
-- `[x]` `PROC-007 (P0)` Process states management
-- `[x]` `PROC-008 (P1)` Signals or notifications
-- `[x]` `PROC-009 (P1)` Process resource limits
+## 1) Boot & Recovery
 
-## 4) Memory Management
-- `[x]` `MM-001 (P0)` Physical memory manager
-- `[x]` `MM-002 (P0)` Virtual memory
-- `[x]` `MM-003 (P0)` Paging system
-- `[x]` `MM-004 (P0)` Memory protection between processes
-- `[x]` `MM-005 (P0)` Kernel heap allocator
-- `[x]` `MM-006 (P1)` User space memory allocation
-- `[x]` `MM-007 (P1)` Memory mapping (mmap-like functionality)
-- `[x]` `MM-008 (P2)` Swap support
+* `[x]` `BOOT-001 (P0)` Меню загрузки отображается
+* `[x]` `BOOT-002 (P0)` Есть пункт recovery shell
+* `[x]` `BOOT-003 (P0)` Логи последней загрузки сохраняются
+* `[x]` `BOOT-004 (P0)` Логи читаются из recovery
+* `[x]` `BOOT-005 (P1)` Ошибка загрузки показывает причину
+* `[x]` `BOOT-006 (P1)` Ошибка предлагает действия
+* `[x]` `BOOT-007 (P1)` Можно выбрать прошлый kernel
 
-## 5) Filesystem Support
-- `[x]` `FS-001 (P0)` Native filesystem implementation
-- `[x]` `FS-002 (P0)` Block device layer
-- `[x]` `FS-003 (P1)` File permissions and ownership
-- `[x]` `FS-004 (P1)` File caching
-- `[x]` `FS-005 (P0)` Mount system
-- `[x]` `FS-006 (P1)` Support for multiple filesystems
-- `[x]` `FS-007 (P1)` Filesystem reliability and recovery
+## 2) Filesystem Layout
 
-## 6) Device and Driver Model
-- `[x]` `DRV-001 (P0)` Device abstraction layer
-- `[x]` `DRV-002 (P0)` Driver interface
-- `[x]` `DRV-003 (P2)` Hot-plug support
-- `[x]` `DRV-004 (P1)` Device discovery
-- `[x]` `DRV-005 (P1)` Stable driver API
+* `[x]` `FSUX-001 (P0)` /home отделён от system
+* `[x]` `FSUX-002 (P0)` runtime (tmp/run) отделён
+* `[x]` `FSUX-003 (P0)` логи в одном месте
+* `[x]` `FSUX-004 (P1)` команда объясняет каталог
+* `[x]` `FSUX-005 (P1)` видно mount points
+* `[x]` `FSUX-006 (P2)` видно источник файла (package)
 
-## 7) Input / Output System
-- `[x]` `IO-001 (P0)` Unified I/O interfaces
-- `[x]` `IO-002 (P0)` Character devices
-- `[x]` `IO-003 (P0)` Block devices
-- `[x]` `IO-004 (P1)` Network devices
-- `[x]` `IO-005 (P1)` Efficient buffering
+## 3) Shell
 
-## 8) User Space Environment
-- `[x]` `USR-001 (P0)` System call interface
-- `[x]` `USR-002 (P1)` Standard C library (libc)
-- `[x]` `USR-003 (P1)` Basic command line utilities
-- `[x]` `USR-004 (P1)` Shell
-- `[x]` `USR-005 (P0)` Process execution and program loading
+* `[x]` `SH-001 (P0)` История команд сохраняется
+* `[x]` `SH-002 (P0)` Поиск по истории работает
+* `[x]` `SH-003 (P0)` Tab completion
+* `[x]` `SH-004 (P1)` Prompt показывает cwd
+* `[x]` `SH-005 (P1)` Prompt показывает exit code
+* `[x]` `SH-006 (P1)` Prompt не ломает скрипты
+* `[ ]` `SH-007 (P2)` Git статус в prompt
 
-## 9) Inter-process Communication
-- `[x]` `IPC-001 (P1)` Pipes
-- `[x]` `IPC-002 (P1)` Signals
-- `[x]` `IPC-003 (P1)` Shared memory
-- `[x]` `IPC-004 (P1)` Message passing
-- `[x]` `IPC-005 (P2)` Sockets
+## 4) Errors
 
-## 10) Security Model
-- `[x]` `SEC-001 (P1)` User accounts
-- `[x]` `SEC-002 (P1)` Permissions and access control
-- `[x]` `SEC-003 (P0)` Process isolation
-- `[x]` `SEC-004 (P1)` Executable permission control
-- `[x]` `SEC-005 (P0)` Kernel protection mechanisms
+* `[x]` `ERR-001 (P0)` Ошибка указывает объект (файл/сервис)
+* `[x]` `ERR-002 (P0)` Ошибка указывает причину
+* `[x]` `ERR-003 (P0)` Ошибка предлагает действие
+* `[x]` `ERR-004 (P1)` Разные коды ошибок
+* `[x]` `ERR-005 (P1)` verbose режим
 
-## 11) Networking
-- `[x]` `NET-001 (P1)` Network stack (TCP/IP)
-- `[x]` `NET-002 (P1)` Socket interface
-- `[x]` `NET-003 (P2)` Basic networking utilities
-- `[x]` `NET-004 (P1)` Driver support for network interfaces
+## 5) Package Manager
 
-## 12) System Interfaces
-- `[x]` `SYSIF-001 (P1)` `/dev` device filesystem
-- `[x]` `SYSIF-002 (P1)` `/proc` process information filesystem
-- `[x]` `SYSIF-003 (P2)` System configuration interfaces
+* `[x]` `PKG-001 (P0)` install работает
+* `[x]` `PKG-002 (P0)` remove работает
+* `[x]` `PKG-003 (P0)` search работает
+* `[x]` `PKG-004 (P0)` update работает
+* `[x]` `PKG-005 (P0)` список изменений ДО применения
+* `[x]` `PKG-006 (P1)` dry-run
+* `[x]` `PKG-007 (P1)` downgrade
+* `[x]` `PKG-008 (P1)` проверка хэшей
 
-## 13) Program Loading
-- `[x]` `LOAD-001 (P0)` Executable format support (ELF or similar)
-- `[x]` `LOAD-002 (P2)` Dynamic linking support
-- `[x]` `LOAD-003 (P2)` Shared libraries
+## 6) Docs
 
-## 14) System Utilities
-- `[x]` `UTIL-001 (P1)` Process monitoring tools
-- `[x]` `UTIL-002 (P1)` Filesystem utilities
-- `[x]` `UTIL-003 (P2)` System configuration tools
+* `[x]` `DOC-001 (P0)` man page существует
+* `[x]` `DOC-002 (P0)` есть примеры
+* `[x]` `DOC-003 (P1)` команда help
+* `[x]` `DOC-004 (P1)` troubleshooting есть
 
-## 15) Package and Software Management
-- `[x]` `PKG-001 (P2)` Program format
-- `[x]` `PKG-002 (P2)` Package manager
-- `[x]` `PKG-003 (P2)` Software repository system
+## 7) Services
 
-## 16) Development Tools
-- `[x]` `DEV-001 (P1)` Compiler support
-- `[x]` `DEV-002 (P1)` Debugger support
-- `[x]` `DEV-003 (P1)` System headers and SDK
-- `[x]` `DEV-004 (P1)` Documentation for system APIs
+* `[x]` `SRV-001 (P0)` start
+* `[x]` `SRV-002 (P0)` stop
+* `[x]` `SRV-003 (P0)` status
+* `[x]` `SRV-004 (P1)` enable
+* `[x]` `SRV-005 (P1)` disable
+* `[x]` `SRV-006 (P1)` статус показывает ошибки
 
-## 17) Graphics
-- `[x]` `GFX-001 (P2)` Framebuffer interface
-- `[x]` `GFX-003 (P2)` Graphics driver support
+## 8) Logging
 
-## 18) Portability
-- `[x]` `PORT-001 (P2)` Support for multiple architectures
-- `[x]` `PORT-002 (P1)` Clean architecture-specific code separation
+* `[x]` `LOG-001 (P0)` логи доступны
+* `[x]` `LOG-002 (P0)` фильтр по времени
+* `[x]` `LOG-003 (P1)` фильтр по сервису
+* `[x]` `LOG-004 (P1)` экспорт логов
 
-## 19) Documentation
-- `[d]` `DOC-001 (P1)` Kernel documentation
-- `[d]` `DOC-002 (P1)` Subsystem documentation
-- `[d]` `DOC-003 (P1)` Developer documentation
-- `[d]` `DOC-004 (P2)` User documentation
+## 9) Permissions
 
-## 20) Stability and Reliability
-- `[x]` `REL-001 (P1)` Crash handling
-- `[x]` `REL-002 (P1)` Logging system
-- `[x]` `REL-003 (P1)` Debugging tools
-- `[x]` `REL-004 (P1)` Testing infrastructure
+* `[x]` `SEC-001 (P0)` chmod работает
+* `[x]` `SEC-002 (P0)` chown работает
+* `[x]` `SEC-003 (P0)` ошибка доступа объясняется
+* `[x]` `SEC-004 (P1)` sudo есть
 
-## 21) Performance
-- `[x]` `PERF-001 (P1)` Efficient scheduler
-- `[x]` `PERF-002 (P1)` Efficient memory subsystem
-- `[x]` `PERF-003 (P1)` Low overhead system calls
-- `[x]` `PERF-004 (P1)` I/O performance optimization
+## 10) Terminal
 
-## 22) Modularity
-- `[x]` `MOD-001 (P2)` Loadable kernel modules
-- `[x]` `MOD-002 (P1)` Extensible driver system
-- `[x]` `MOD-003 (P2)` Optional system components
+* `[x]` `TERM-001 (P0)` UTF-8 корректен
+* `[x]` `TERM-002 (P0)` цвета работают
+* `[x]` `TERM-003 (P0)` pager листает
+* `[x]` `TERM-004 (P0)` pager выходит без зависаний
+* `[x]` `TERM-005 (P1)` pager поиск
+* `[x]` `TERM-006 (P1)` pager интеграция
 
-## 23) Compatibility (Long-Term)
-- `[x]` `COMP-001 (P3)` POSIX compatibility
-- `[x]` `COMP-002 (P3)` Ability to run common Unix tools
-- `[x]` `COMP-003 (P3)` Application compatibility layer
+## 11) Editor
 
-## 24) Maintenance and Updates
-- `[x]` `MAINT-001 (P2)` Update system
-- `[d]` `MAINT-002 (P2)` Backward compatibility policies
-- `[x]` `MAINT-003 (P2)` Versioning of system interfaces
+* `[x]` `EDIT-001 (P0)` открыть файл
+* `[x]` `EDIT-002 (P0)` сохранить файл
+* `[x]` `EDIT-003 (P1)` поиск текста
+* `[x]` `EDIT-004 (P1)` подсветка синтаксиса
+
+## 12) Search
+
+* `[x]` `FIND-001 (P0)` find файлы
+* `[x]` `FIND-002 (P0)` grep текст
+* `[x]` `FIND-003 (P1)` поиск команд
+
+## 13) Networking
+
+* `[x]` `NET-001 (P0)` показать IP
+* `[x]` `NET-002 (P0)` показать route
+* `[x]` `NET-003 (P0)` поддержка разных сетевых контролерров (рабочие: e1000/e1000e/часть igb + RTL8139 + RTL8168/8111 + virtio-net legacy, матрица в `docs/NETWORK_DRIVERS.md`)
+* `[x]` `NET-004 (P1)` ping работает
+* `[x]` `NET-005 (P1)` SSH работает
+
+## 14) Processes
+
+* `[x]` `PROC-001 (P0)` список процессов
+* `[x]` `PROC-002 (P0)` kill работает
+* `[x]` `PROC-003 (P1)` CPU usage
+* `[x]` `PROC-004 (P1)` tree
+
+## 15) Storage
+
+* `[x]` `DISK-001 (P0)` df
+* `[x]` `DISK-002 (P0)` du
+* `[x]` `DISK-003 (P1)` проверка диска
+
+## 16) Backup
+
+* `[x]` `BKP-001 (P0)` backup создать
+* `[x]` `BKP-002 (P1)` restore
+
+## 17) Resources
+
+* `[x]` `RES-001 (P0)` CPU usage
+* `[x]` `RES-002 (P0)` RAM usage
+
+## 18) Scripting
+
+* `[x]` `SCRIPT-001 (P0)` exit codes
+* `[x]` `SCRIPT-002 (P1)` стабильный CLI
+
+## 19) Dev
+
+* `[x]` `DEV-001 (P1)` компилятор
+* `[x]` `DEV-002 (P1)` debugger
+
+## 20) Philosophy
+
+* `[x]` `PHIL-001 (P0)` нет скрытых действий
+* `[x]` `PHIL-002 (P0)` ошибки не игнорируются
+* `[x]` `PHIL-003 (P0)` не является Unix-based 
+
+---
+
+## Meta
+
+* `[x]` `META-001 (P0)` Можно ответить: что это
+* `[x]` `META-002 (P0)` Где настраивается
+* `[x]` `META-003 (P0)` Как дебажить

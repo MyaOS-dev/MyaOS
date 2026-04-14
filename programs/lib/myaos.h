@@ -129,6 +129,47 @@ static inline int mya_console_readchar(void) {
     return (int)mya_syscall(MYAOS_SYS_CONSOLE_READCHAR, 0, 0, 0, 0, 0);
 }
 
+static inline int mya_input_key_state(uint16_t keycode) {
+    return (int)mya_syscall(MYAOS_SYS_INPUT_KEY_STATE, (uint64_t)keycode, 0, 0, 0, 0);
+}
+
+static inline int mya_input_keyboard_state(uint8_t* out_keys, uint32_t out_size) {
+    return (int)mya_syscall(
+        MYAOS_SYS_INPUT_KEYBOARD_STATE,
+        (uint64_t)(uintptr_t)out_keys,
+        (uint64_t)out_size,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_input_key_event_read(myaos_input_key_event_t* out_event) {
+    return (int)mya_syscall(MYAOS_SYS_INPUT_KEY_EVENT_READ, (uint64_t)(uintptr_t)out_event, 0, 0, 0, 0);
+}
+
+static inline int mya_input_wait(uint32_t timeout_ticks, uint32_t* out_events) {
+    return (int)mya_syscall(
+        MYAOS_SYS_INPUT_WAIT,
+        (uint64_t)timeout_ticks,
+        (uint64_t)(uintptr_t)out_events,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_event_poll(uint32_t mask, uint8_t clear, uint32_t* out_events) {
+    return (int)mya_syscall(
+        MYAOS_SYS_EVENT_POLL,
+        (uint64_t)mask,
+        (uint64_t)clear,
+        (uint64_t)(uintptr_t)out_events,
+        0,
+        0
+    );
+}
+
 static inline int mya_fs_list(const char* path, myaos_dirent_t* out, uint32_t max_entries, uint32_t* out_count) {
     return (int)mya_syscall(
         MYAOS_SYS_FS_LIST,
@@ -204,6 +245,102 @@ static inline int mya_fs_mount(const char* source, const char* path, const char*
     );
 }
 
+static inline int mya_fs_chmod(const char* path, uint32_t mode) {
+    return (int)mya_syscall(
+        MYAOS_SYS_FS_CHMOD,
+        (uint64_t)(uintptr_t)path,
+        (uint64_t)mode,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_fs_chown(const char* path, uint32_t owner_uid) {
+    return (int)mya_syscall(
+        MYAOS_SYS_FS_CHOWN,
+        (uint64_t)(uintptr_t)path,
+        (uint64_t)owner_uid,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_posix_open(const char* path, uint32_t flags, int32_t* out_fd) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_OPEN,
+        (uint64_t)(uintptr_t)path,
+        (uint64_t)flags,
+        (uint64_t)(uintptr_t)out_fd,
+        0,
+        0
+    );
+}
+
+static inline int mya_posix_close(int32_t fd) {
+    return (int)mya_syscall(MYAOS_SYS_POSIX_CLOSE, (uint64_t)fd, 0, 0, 0, 0);
+}
+
+static inline int mya_posix_read(int32_t fd, void* out_buf, uint32_t max_len, uint32_t* out_read) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_READ,
+        (uint64_t)fd,
+        (uint64_t)(uintptr_t)out_buf,
+        (uint64_t)max_len,
+        (uint64_t)(uintptr_t)out_read,
+        0
+    );
+}
+
+static inline int mya_posix_write(int32_t fd, const void* data, uint32_t len, uint32_t* out_written) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_WRITE,
+        (uint64_t)fd,
+        (uint64_t)(uintptr_t)data,
+        (uint64_t)len,
+        (uint64_t)(uintptr_t)out_written,
+        0
+    );
+}
+
+static inline int mya_posix_lseek(int32_t fd, int64_t offset, uint32_t whence, uint64_t* out_offset) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_LSEEK,
+        (uint64_t)fd,
+        (uint64_t)offset,
+        (uint64_t)whence,
+        (uint64_t)(uintptr_t)out_offset,
+        0
+    );
+}
+
+static inline int mya_posix_fstat(int32_t fd, myaos_posix_stat_t* out) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_FSTAT,
+        (uint64_t)fd,
+        (uint64_t)(uintptr_t)out,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_posix_dup2(int32_t old_fd, int32_t new_fd) {
+    return (int)mya_syscall(MYAOS_SYS_POSIX_DUP2, (uint64_t)old_fd, (uint64_t)new_fd, 0, 0, 0);
+}
+
+static inline int mya_posix_poll(myaos_posix_pollfd_t* fds, uint32_t count, uint32_t timeout_ticks, uint32_t* out_ready) {
+    return (int)mya_syscall(
+        MYAOS_SYS_POSIX_POLL,
+        (uint64_t)(uintptr_t)fds,
+        (uint64_t)count,
+        (uint64_t)timeout_ticks,
+        (uint64_t)(uintptr_t)out_ready,
+        0
+    );
+}
+
 static inline int mya_proc_spawn(const char* path, int argc, const char* const* argv, uint8_t flags, int32_t* out_pid) {
     return (int)mya_syscall(
         MYAOS_SYS_PROC_SPAWN,
@@ -230,6 +367,17 @@ static inline int mya_proc_spawn_ex(
         (uint64_t)(uintptr_t)opts,
         (uint64_t)(uintptr_t)out_pid
     );
+}
+
+static inline int mya_proc_spawn_linux(const char* path, int argc, const char* const* argv, int32_t* out_pid) {
+    myaos_spawn_opts_t opts;
+    opts.flags = MYAOS_SPAWN_LINUX;
+    opts.stdout_append = 0u;
+    opts.priority = 0u;
+    opts.reserved0 = 0u;
+    opts.cpu_limit_ticks = 0u;
+    opts.stdout_path[0] = '\0';
+    return mya_proc_spawn_ex(path, argc, argv, &opts, out_pid);
 }
 
 static inline int mya_proc_exec(const char* path, int argc, const char* const* argv) {
@@ -270,6 +418,14 @@ static inline void mya_proc_sleep(uint64_t ticks) {
     (void)mya_syscall(MYAOS_SYS_PROC_SLEEP, ticks, 0, 0, 0, 0);
 }
 
+static inline uint64_t mya_time_ticks(void) {
+    return (uint64_t)mya_syscall(MYAOS_SYS_TIME_TICKS, 0, 0, 0, 0, 0);
+}
+
+static inline uint32_t mya_time_freq(void) {
+    return (uint32_t)mya_syscall(MYAOS_SYS_TIME_FREQ, 0, 0, 0, 0, 0);
+}
+
 static inline int32_t mya_proc_getpid(void) {
     return (int32_t)mya_syscall(MYAOS_SYS_PROC_GETPID, 0, 0, 0, 0, 0);
 }
@@ -280,6 +436,151 @@ static inline uint32_t mya_sec_whoami(void) {
 
 static inline int mya_sec_login(const char* user_name) {
     return (int)mya_syscall(MYAOS_SYS_SEC_LOGIN, (uint64_t)(uintptr_t)user_name, 0, 0, 0, 0);
+}
+
+static inline int mya_fb_pref_set(uint8_t has_mode, uint32_t mode) {
+    return (int)mya_syscall(MYAOS_SYS_FB_PREF_SET, (uint64_t)has_mode, (uint64_t)mode, 0, 0, 0);
+}
+
+static inline int mya_fb_pref_get(uint32_t* out_has_mode, uint32_t* out_mode) {
+    return (int)mya_syscall(
+        MYAOS_SYS_FB_PREF_GET,
+        (uint64_t)(uintptr_t)out_has_mode,
+        (uint64_t)(uintptr_t)out_mode,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_gfx_mode_set(uint32_t mode) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_MODE_SET, (uint64_t)mode, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_mode_get(uint32_t* out_mode) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_MODE_GET, (uint64_t)(uintptr_t)out_mode, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_info_get(myaos_gfx_info_t* out_info) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_INFO_GET, (uint64_t)(uintptr_t)out_info, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_draw(const myaos_gfx_object_t* obj) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_DRAW, (uint64_t)(uintptr_t)obj, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_draw_batch(const myaos_gfx_object_t* objs, uint32_t count) {
+    return (int)mya_syscall(
+        MYAOS_SYS_GFX_DRAW_BATCH,
+        (uint64_t)(uintptr_t)objs,
+        (uint64_t)count,
+        0,
+        0,
+        0
+    );
+}
+
+static inline int mya_gfx_blit(const myaos_gfx_blit_t* blit) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_BLIT, (uint64_t)(uintptr_t)blit, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_present(void) {
+    return (int)mya_syscall(MYAOS_SYS_GFX_PRESENT, 0, 0, 0, 0, 0);
+}
+
+static inline int mya_gfx_clear(uint32_t color) {
+    myaos_gfx_object_t obj;
+    obj.type = MYAOS_GFX_OBJ_CLEAR;
+    obj.x0 = 0;
+    obj.y0 = 0;
+    obj.x1 = 0;
+    obj.y1 = 0;
+    obj.color = color;
+    obj.color2 = 0u;
+    obj.text_ptr = 0u;
+    obj.text_len = 0u;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
+}
+
+static inline int mya_gfx_pixel(int32_t x, int32_t y, uint32_t color) {
+    myaos_gfx_object_t obj;
+    obj.type = MYAOS_GFX_OBJ_PIXEL;
+    obj.x0 = x;
+    obj.y0 = y;
+    obj.x1 = 0;
+    obj.y1 = 0;
+    obj.color = color;
+    obj.color2 = 0u;
+    obj.text_ptr = 0u;
+    obj.text_len = 0u;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
+}
+
+static inline int mya_gfx_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color) {
+    myaos_gfx_object_t obj;
+    obj.type = MYAOS_GFX_OBJ_LINE;
+    obj.x0 = x0;
+    obj.y0 = y0;
+    obj.x1 = x1;
+    obj.y1 = y1;
+    obj.color = color;
+    obj.color2 = 0u;
+    obj.text_ptr = 0u;
+    obj.text_len = 0u;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
+}
+
+static inline int mya_gfx_rect(int32_t x, int32_t y, int32_t width, int32_t height, uint32_t color) {
+    myaos_gfx_object_t obj;
+    obj.type = MYAOS_GFX_OBJ_RECT;
+    obj.x0 = x;
+    obj.y0 = y;
+    obj.x1 = width;
+    obj.y1 = height;
+    obj.color = color;
+    obj.color2 = 0u;
+    obj.text_ptr = 0u;
+    obj.text_len = 0u;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
+}
+
+static inline int mya_gfx_frame(int32_t x, int32_t y, int32_t width, int32_t height, uint32_t color) {
+    myaos_gfx_object_t obj;
+    obj.type = MYAOS_GFX_OBJ_FRAME;
+    obj.x0 = x;
+    obj.y0 = y;
+    obj.x1 = width;
+    obj.y1 = height;
+    obj.color = color;
+    obj.color2 = 0u;
+    obj.text_ptr = 0u;
+    obj.text_len = 0u;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
+}
+
+static inline int mya_gfx_text(int32_t x, int32_t y, uint32_t fg, uint32_t bg, const char* text) {
+    myaos_gfx_object_t obj;
+    const size_t max_len = 240u;
+    size_t len = mya_strlen(text);
+    if (len > max_len) {
+        len = max_len;
+    }
+    obj.type = MYAOS_GFX_OBJ_TEXT;
+    obj.x0 = x;
+    obj.y0 = y;
+    obj.x1 = 0;
+    obj.y1 = 0;
+    obj.color = fg;
+    obj.color2 = bg;
+    obj.text_ptr = (uint64_t)(uintptr_t)text;
+    obj.text_len = (uint32_t)len;
+    obj.flags = 0u;
+    return mya_gfx_draw(&obj);
 }
 
 static inline int mya_proc_list(myaos_proc_info_t* out, uint32_t max_entries, uint32_t* out_count) {
@@ -539,6 +840,17 @@ static inline int mya_sock_connect(int32_t fd, uint16_t dst_port) {
     );
 }
 
+static inline int mya_sock_connect4(int32_t fd, uint32_t dst_ip, uint16_t dst_port) {
+    return (int)mya_syscall(
+        MYAOS_SYS_SOCK_CONNECT4,
+        (uint64_t)fd,
+        (uint64_t)dst_ip,
+        (uint64_t)dst_port,
+        0,
+        0
+    );
+}
+
 static inline int mya_sock_close(int32_t fd) {
     return (int)mya_syscall(MYAOS_SYS_SOCK_CLOSE, (uint64_t)fd, 0, 0, 0, 0);
 }
@@ -632,6 +944,23 @@ static inline int mya_net_send_udp4(
     );
 }
 
+static inline int mya_net_ping4(
+    uint32_t dst_ip,
+    uint16_t ident,
+    uint16_t seq,
+    uint32_t timeout_polls,
+    uint32_t* out_rtt_ticks
+) {
+    return (int)mya_syscall(
+        MYAOS_SYS_NET_PING4,
+        (uint64_t)dst_ip,
+        (uint64_t)ident,
+        (uint64_t)seq,
+        (uint64_t)timeout_polls,
+        (uint64_t)(uintptr_t)out_rtt_ticks
+    );
+}
+
 static inline int mya_dev_list(myaos_device_info_t* out, uint32_t max_entries, uint32_t* out_count) {
     return (int)mya_syscall(
         MYAOS_SYS_DEV_LIST,
@@ -708,6 +1037,10 @@ static inline int mya_mod_load(const char* name) {
     return (int)mya_syscall(MYAOS_SYS_MOD_LOAD, (uint64_t)(uintptr_t)name, 0, 0, 0, 0);
 }
 
+static inline int mya_mod_load_file(const char* path) {
+    return (int)mya_syscall(MYAOS_SYS_MOD_LOAD_FILE, (uint64_t)(uintptr_t)path, 0, 0, 0, 0);
+}
+
 static inline int mya_mod_unload(const char* name) {
     return (int)mya_syscall(MYAOS_SYS_MOD_UNLOAD, (uint64_t)(uintptr_t)name, 0, 0, 0, 0);
 }
@@ -731,6 +1064,17 @@ static inline void mya_shutdown(void) {
     for (;;) {
         __asm__ __volatile__("pause");
     }
+}
+
+static inline uint32_t mya_utf8_prev_start(const char* text, uint32_t pos) {
+    if (!text || pos == 0u) {
+        return 0u;
+    }
+    pos--;
+    while (pos > 0u && (((uint8_t)text[pos] & 0xC0u) == 0x80u)) {
+        pos--;
+    }
+    return pos;
 }
 
 static inline int mya_console_readline(char* out, uint32_t out_size, uint8_t echo) {
@@ -760,7 +1104,7 @@ static inline int mya_console_readline(char* out, uint32_t out_size, uint8_t ech
         }
         if (ch == '\b' || ch == 127) {
             if (len > 0) {
-                len--;
+                len = mya_utf8_prev_start(out, len);
                 out[len] = '\0';
                 if (echo) {
                     mya_puts("\b");
@@ -768,7 +1112,7 @@ static inline int mya_console_readline(char* out, uint32_t out_size, uint8_t ech
             }
             continue;
         }
-        if (ch < 32 || ch > 126) {
+        if (((uint8_t)ch < 32u) || ((uint8_t)ch == 127u)) {
             continue;
         }
         if (len + 1 < out_size) {

@@ -4,6 +4,7 @@
 int program_main(int argc, char** argv) {
     uint64_t pid_u64 = 0;
     int32_t exit_code = 143;
+    int rc;
 
     if (argc < 2 || mya_strto_u64(argv[1], &pid_u64) != 0 || pid_u64 > 0x7FFFFFFFu) {
         mya_putln("usage: kill PID [EXIT_CODE]");
@@ -19,8 +20,18 @@ int program_main(int argc, char** argv) {
         exit_code = (int32_t)ec;
     }
 
-    if (mya_proc_kill((int32_t)pid_u64, exit_code) != 0) {
-        mya_putln("kill: failed");
+    rc = mya_proc_kill((int32_t)pid_u64, exit_code);
+    if (rc != 0) {
+        mya_puts("kill: ");
+        mya_put_u32((uint32_t)pid_u64);
+        mya_puts(": ");
+        if (rc == -1) {
+            mya_putln("cannot terminate process");
+            mya_putln("hint: process may not exist, may already be finished, or is not your child");
+        } else {
+            mya_putln("kernel rejected terminate request");
+            mya_putln("hint: run ps and retry with a valid process id");
+        }
         return 1;
     }
 

@@ -1,2 +1,2 @@
 exec=/bin/compat.elf
-run unix-like command through compatibility layer
+legacy shim: resolve command via /cmd manifest and run it (deprecated, use direct command or lxrun)

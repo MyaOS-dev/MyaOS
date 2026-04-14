@@ -4,9 +4,11 @@ KERNEL := kernel.elf
 ESP_IMAGE := esp.img
 OVMF_CODE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS_TEMPLATE := /usr/share/edk2/x64/OVMF_VARS.4m.fd
-OVMF_VARS := $(BUILD)/OVMF_VARS.4m.fd
+OVMF_STATE_DIR := .ovmf
+OVMF_VARS := $(OVMF_STATE_DIR)/OVMF_VARS.4m.fd
 MYAOS_DEBUG ?= 0
 ARCH ?= x86_64
+MYAOS_DEMOS ?= 0
 
 CC := clang
 LD_KERNEL := ld.lld
@@ -41,6 +43,7 @@ KERNEL_C_SOURCES := $(sort \
 	$(wildcard kernel/gfx/*.c) \
 	$(wildcard kernel/mm/*.c) \
 	$(wildcard kernel/net/*.c) \
+	$(wildcard kernel/modules/*.c) \
 	$(wildcard kernel/proc/*.c) \
 	$(wildcard kernel/arch/$(ARCH)/*.c))
 
@@ -55,29 +58,52 @@ KERNEL_C_OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SOURCES))
 KERNEL_OBJECTS := $(KERNEL_C_OBJECTS) $(KERNEL_ASM_OBJECTS)
 
 PROGRAM_SOURCES := \
-	programs/cate.c \
 	programs/system/about.c \
 	programs/system/add.c \
 	programs/system/msh.c \
+	programs/system/cc.c \
+	programs/system/dbg.c \
 	programs/system/cls.c \
+	programs/system/color.c \
 	programs/system/say.c \
+	programs/system/start.c \
+	programs/system/enable.c \
+	programs/system/disable.c \
+	programs/system/svcboot.c \
+	programs/system/pathinfo.c \
+	programs/system/chooseres.c \
+	programs/system/which.c \
+	programs/system/status.c \
 	programs/system/stop.c \
 	programs/system/restart.c \
 	programs/system/poweroff.c \
 	programs/system/pause.c \
 	programs/system/ok.c \
 	programs/system/fail.c \
+	programs/system/log.c \
+	programs/system/edit.c \
+	programs/system/nano.c \
+	programs/system/backup.c \
+	programs/system/restore.c \
 	programs/system/syscfg.c \
 	programs/system/whoami.c \
 	programs/system/login.c \
 	programs/system/abi.c \
 	programs/system/pkg.c \
+	programs/system/man.c \
 	programs/system/update.c \
 	programs/system/modctl.c \
 	programs/system/hotplug.c \
 	programs/system/compat.c \
+	programs/system/lxrun.c \
 	programs/system/uname.c \
+	programs/system/chmod.c \
+	programs/system/chown.c \
 	programs/system/kill.c \
+	programs/system/sudo.c \
+	programs/system/fsck.c \
+	programs/system/tar.c \
+	programs/system/xz.c \
 	programs/fs/list.c \
 	programs/fs/show.c \
 	programs/fs/del.c \
@@ -87,6 +113,9 @@ PROGRAM_SOURCES := \
 	programs/fs/save.c \
 	programs/fs/whereami.c \
 	programs/fs/attached.c \
+	programs/fs/find.c \
+	programs/fs/df.c \
+	programs/fs/du.c \
 	programs/debug/disks.c \
 	programs/debug/cpuburn.c \
 	programs/debug/limitcheck.c \
@@ -96,13 +125,18 @@ PROGRAM_SOURCES := \
 	programs/debug/schedcheck.c \
 	programs/debug/seccheck.c \
 	programs/debug/tasks.c \
+	programs/debug/proctree.c \
 	programs/debug/devls.c \
 	programs/debug/fbinfo.c \
+	programs/debug/bmpview.c \
+	programs/debug/gfxdemo.c \
 	programs/debug/netstat.c \
 	programs/debug/swapstat.c \
 	programs/debug/swapcheck.c \
 	programs/debug/posixcheck.c \
 	programs/debug/dlcheck.c \
+	programs/debug/p0check.c \
+	programs/debug/rescpu.c \
 	programs/text/count.c \
 	programs/text/less.c \
 	programs/text/findtext.c \
@@ -121,13 +155,30 @@ PROGRAM_SOURCES := \
 	programs/net/netrecv.c \
 	programs/net/tcpsend.c \
 	programs/net/tcprecv.c \
-	programs/net/udp4send.c
+	programs/net/udp4send.c \
+	programs/net/ping.c \
+	programs/net/nslookup.c \
+	programs/net/curl.c \
+	programs/net/ssh.c \
+	programs/net/ip.c \
+	programs/net/route.c \
+	programs/net/wifi.c
+
+DEMO_PROGRAM_SOURCES := \
+	programs/cate.c
+
+ifeq ($(MYAOS_DEMOS),1)
+PROGRAM_SOURCES += $(DEMO_PROGRAM_SOURCES)
+endif
 
 PROGRAM_BINS := $(patsubst programs/%.c,$(BUILD)/programs/%.elf,$(PROGRAM_SOURCES))
-LIB_SOURCES := \
-	programs/shared/libdemo.c
+LIB_SOURCES := $(sort $(wildcard programs/shared/*.c))
 LIB_BINS := $(patsubst programs/shared/%.c,$(BUILD)/lib/%.so,$(LIB_SOURCES))
 PROGRAM_MANIFESTS := $(sort $(wildcard programs/cmd/*.cmd))
+PROGRAM_ASSETS := $(sort $(filter-out programs/assets/runtime-lib programs/assets/runtime-glibc,$(wildcard programs/assets/*)))
+PROGRAM_RUNTIME_LIBS := $(sort $(wildcard programs/assets/runtime-lib/*))
+PROGRAM_RUNTIME_GLIBC_LD := $(sort $(wildcard programs/assets/runtime-glibc/lib64/*))
+PROGRAM_RUNTIME_GLIBC_LIBS := $(sort $(wildcard programs/assets/runtime-glibc/usr/lib/*))
 AUTORUN_SCRIPT := programs/autorun.sh
 
 all: $(BUILD)/$(EFI_BOOT) $(BUILD)/$(KERNEL) $(PROGRAM_BINS) $(LIB_BINS) $(BUILD)/$(ESP_IMAGE)
@@ -182,7 +233,7 @@ $(BUILD)/lib/%.so: programs/shared/%.c Makefile | $(BUILD)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS_SHARED) $(LDFLAGS_SHARED) $< -o $@
 
-$(BUILD)/$(ESP_IMAGE): $(BUILD)/$(EFI_BOOT) $(BUILD)/$(KERNEL) $(PROGRAM_BINS) $(LIB_BINS) $(PROGRAM_MANIFESTS) $(AUTORUN_SCRIPT) | $(BUILD)
+$(BUILD)/$(ESP_IMAGE): $(BUILD)/$(EFI_BOOT) $(BUILD)/$(KERNEL) $(PROGRAM_BINS) $(LIB_BINS) $(PROGRAM_MANIFESTS) $(PROGRAM_ASSETS) $(PROGRAM_RUNTIME_LIBS) $(PROGRAM_RUNTIME_GLIBC_LD) $(PROGRAM_RUNTIME_GLIBC_LIBS) $(AUTORUN_SCRIPT) | $(BUILD)
 	rm -f $@
 	dd if=/dev/zero of=$@ bs=1M count=64
 	mkfs.fat -F 32 $@
@@ -190,14 +241,32 @@ $(BUILD)/$(ESP_IMAGE): $(BUILD)/$(EFI_BOOT) $(BUILD)/$(KERNEL) $(PROGRAM_BINS) $
 	mmd -i $@ ::/EFI/BOOT
 	mmd -i $@ ::/bin
 	mmd -i $@ ::/lib
+	mmd -i $@ ::/lib64
+	mmd -i $@ ::/usr
+	mmd -i $@ ::/usr/lib
+	mmd -i $@ ::/usr/lib64
 	mmd -i $@ ::/cmd
+	mmd -i $@ ::/assets
 	mcopy -i $@ $(BUILD)/$(EFI_BOOT) ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i $@ $(BUILD)/$(KERNEL) ::/kernel.elf
 	mcopy -i $@ $(BUILD)/$(KERNEL) ::/EFI/BOOT/kernel.elf
 	mcopy -i $@ $(AUTORUN_SCRIPT) ::/autorun.sh
 	for prog in $(PROGRAM_BINS); do mcopy -i $@ $$prog ::/bin/$$(basename $$prog); done
+	# Baseline CLI entrypoints (v1.x compatibility contract).
+	mcopy -i $@ $(BUILD)/programs/system/msh.elf ::/bin/sh
+	mcopy -i $@ $(BUILD)/programs/fs/list.elf ::/bin/ls
+	mcopy -i $@ $(BUILD)/programs/fs/show.elf ::/bin/cat
+	mcopy -i $@ $(BUILD)/programs/system/pkg.elf ::/bin/pkg
+	# Make Linux BusyBox reachable from ash by default PATH (/bin).
+	if [ -f programs/assets/busybox ]; then mcopy -o -i $@ programs/assets/busybox ::/bin/busybox; fi
 	for lib in $(LIB_BINS); do mcopy -i $@ $$lib ::/lib/$$(basename $$lib); done
+	for rlib in $(PROGRAM_RUNTIME_LIBS); do mcopy -i $@ $$rlib ::/lib/$$(basename $$rlib); done
+	for rlib in $(PROGRAM_RUNTIME_GLIBC_LD); do mcopy -i $@ $$rlib ::/lib64/$$(basename $$rlib); done
+	# Keep glibc runtime out of /usr/lib to avoid SONAME collisions with musl libs.
+	for rlib in $(PROGRAM_RUNTIME_GLIBC_LIBS); do mcopy -i $@ $$rlib ::/usr/lib64/$$(basename $$rlib); done
+	for rlib in $(PROGRAM_RUNTIME_GLIBC_LIBS); do mcopy -i $@ $$rlib ::/lib64/$$(basename $$rlib); done
 	for manifest in $(PROGRAM_MANIFESTS); do mcopy -i $@ $$manifest ::/cmd/$$(basename $$manifest); done
+	for asset in $(PROGRAM_ASSETS); do mcopy -i $@ $$asset ::/assets/$$(basename $$asset); done
 
 run: all $(OVMF_VARS)
 	qemu-system-x86_64 \
@@ -245,6 +314,12 @@ test: all
 test-runtime: all $(OVMF_VARS)
 	./scripts/test_runtime.sh
 
+test-regression: all
+	./scripts/test_regression.sh
+
+test-stress: all $(OVMF_VARS)
+	./scripts/test_stress.sh
+
 myafs-driver:
 	./tools/myafs_driver/build.sh
 
@@ -266,8 +341,9 @@ clean:
 	rm -f tools/myafs_driver/mkfs.myafs tools/myafs_driver/mkfs.myafs.exe
 	$(MAKE) -C tools/myafs_host_linux clean || true
 
-.PHONY: all run debug debug-shell gdb-shell test test-runtime myafs-driver install-mkfs-myafs myafs-host-kmod myafs-host-dkms-install myafs-host-dkms-remove clean
-$(OVMF_VARS): | $(BUILD)
+.PHONY: all run debug debug-shell gdb-shell test test-runtime test-regression test-stress myafs-driver install-mkfs-myafs myafs-host-kmod myafs-host-dkms-install myafs-host-dkms-remove clean
+$(OVMF_VARS):
+	mkdir -p $(dir $@)
 	cp $(OVMF_VARS_TEMPLATE) $@
 
 debug debug-shell gdb-shell: MYAOS_DEBUG=1

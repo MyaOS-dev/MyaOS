@@ -17,6 +17,8 @@ typedef uint64_t       Elf64_Off;
 #define PAGE_SIZE 0x1000ULL
 #define KERNEL_MIN_LOAD_ADDR 0x2000000ULL
 #define BOOT_VOLUME_COPY_LIMIT (128ULL * 1024ULL * 1024ULL)
+#define BOOT_MENU_TIMEOUT_MS 3000u
+#define BOOT_MENU_POLL_MS 25u
 
 typedef struct {
     Elf64_Byte  e_ident[16];
@@ -48,11 +50,32 @@ typedef struct {
 
 typedef void (*kernel_entry_raw_t)(boot_info_t*);
 
+typedef enum {
+    BOOT_KERNEL_NORMAL = 0,
+    BOOT_KERNEL_PREVIOUS = 1,
+} boot_kernel_choice_t;
+
 static EFI_GUID gop_guid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
 static EFI_GUID loaded_image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
 static EFI_GUID block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
 static EFI_GUID simple_fs_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
 static EFI_GUID file_info_guid = EFI_FILE_INFO_ID;
+static EFI_GUID gop_pref_var_guid = { 0x3f9f2e7a, 0x5f19, 0x4d7a, { 0xa6, 0x6c, 0x61, 0x98, 0x59, 0x2d, 0xb2, 0x41 } };
+static EFI_GUID acpi20_guid = ACPI_20_TABLE_GUID;
+static EFI_GUID acpi_guid = ACPI_TABLE_GUID;
+static CHAR16 gop_pref_var_name[] = L"MyaOSGopMode";
+
+static EFI_STATUS read_open_file_to_buffer(
+    EFI_SYSTEM_TABLE* SystemTable,
+    EFI_FILE_PROTOCOL* file,
+    void** kernel_buffer_out,
+    UINTN* kernel_size_out
+);
+
+typedef struct {
+    uint8_t has_mode;
+    uint32_t mode;
+} gop_mode_pref_t;
 
 static inline void dbg_putc(char c) {
     __asm__ __volatile__("outb %0, $0xe9" : : "a"(c));
@@ -74,12 +97,512 @@ static UINTN str16_len(const CHAR16* s) {
     return n;
 }
 
+static CHAR16 char16_to_lower(CHAR16 c) {
+    if (c >= L'A' && c <= L'Z') {
+        return (CHAR16)(c - L'A' + L'a');
+    }
+    return c;
+}
+
+static int str16_eq_ci(const CHAR16* a, const CHAR16* b) {
+    UINTN i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (char16_to_lower(a[i]) != char16_to_lower(b[i])) {
+            return 0;
+        }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+static int guid_eq(const EFI_GUID* a, const EFI_GUID* b) {
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    if (a->Data1 != b->Data1 || a->Data2 != b->Data2 || a->Data3 != b->Data3) {
+        return 0;
+    }
+    for (UINTN i = 0; i < 8u; i++) {
+        if (a->Data4[i] != b->Data4[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void find_acpi_rsdp(EFI_SYSTEM_TABLE* SystemTable, uint64_t* out_rsdp, uint32_t* out_revision) {
+    if (out_rsdp == NULL || out_revision == NULL) {
+        return;
+    }
+    *out_rsdp = 0;
+    *out_revision = 0u;
+
+    if (SystemTable == NULL || SystemTable->ConfigurationTable == NULL) {
+        return;
+    }
+
+    for (UINTN i = 0; i < SystemTable->NumberOfTableEntries; i++) {
+        EFI_CONFIGURATION_TABLE* table = &SystemTable->ConfigurationTable[i];
+        if (guid_eq(&table->VendorGuid, &acpi20_guid)) {
+            *out_rsdp = (uint64_t)(UINTN)table->VendorTable;
+            *out_revision = 2u;
+            return;
+        }
+    }
+
+    for (UINTN i = 0; i < SystemTable->NumberOfTableEntries; i++) {
+        EFI_CONFIGURATION_TABLE* table = &SystemTable->ConfigurationTable[i];
+        if (guid_eq(&table->VendorGuid, &acpi_guid)) {
+            *out_rsdp = (uint64_t)(UINTN)table->VendorTable;
+            *out_revision = 1u;
+            return;
+        }
+    }
+}
+
+static const CHAR16* efi_status_reason(EFI_STATUS status) {
+    switch (status) {
+    case EFI_NOT_FOUND:
+        return L"object was not found on available volumes";
+    case EFI_LOAD_ERROR:
+        return L"loadable image format is invalid or corrupted";
+    case EFI_INVALID_PARAMETER:
+        return L"internal boot argument is invalid";
+    case EFI_OUT_OF_RESOURCES:
+        return L"not enough memory/resources in UEFI firmware";
+    case EFI_ACCESS_DENIED:
+        return L"access denied by firmware or media policy";
+    case EFI_DEVICE_ERROR:
+        return L"device reported I/O error";
+    case EFI_VOLUME_CORRUPTED:
+        return L"filesystem metadata on boot volume is corrupted";
+    case EFI_MEDIA_CHANGED:
+        return L"boot media changed during read operation";
+    default:
+        return L"unspecified firmware/runtime failure";
+    }
+}
+
 static void fatal(EFI_SYSTEM_TABLE* SystemTable, CHAR16* msg, EFI_STATUS status) {
-    Print(L"%s: %r\r\n", msg, status);
+    Print(L"\r\nBOOT FAILURE\r\n");
+    Print(L"step: %s\r\n", msg);
+    Print(L"status: %r\r\n", status);
+    Print(L"reason: %s\r\n", efi_status_reason(status));
+    Print(L"actions:\r\n");
+    Print(L"  1) Verify /kernel.elf exists on EFI partition.\r\n");
+    Print(L"  2) Reboot and press P to try /kernel.prev.elf.\r\n");
+    Print(L"  3) Rebuild image: make -j4 (host) and update ESP.\r\n");
+    Print(L"  4) Check disk/firmware errors if status repeats.\r\n");
     dbg_putc('!');
     for (;;) {
         uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
     }
+}
+
+static boot_kernel_choice_t boot_choose_kernel(EFI_SYSTEM_TABLE* SystemTable) {
+    EFI_INPUT_KEY key;
+    EFI_STATUS status;
+    UINTN waited_ms = 0u;
+
+    if (SystemTable == NULL || SystemTable->ConIn == NULL) {
+        return BOOT_KERNEL_NORMAL;
+    }
+
+    Print(L"\r\nBoot menu: [Enter] normal kernel, [P] previous kernel (auto in 3s)\r\n");
+    Print(L"choice> ");
+
+    for (;;) {
+        status = uefi_call_wrapper(SystemTable->ConIn->ReadKeyStroke, 2, SystemTable->ConIn, &key);
+        if (!EFI_ERROR(status)) {
+            CHAR16 ch = char16_to_lower(key.UnicodeChar);
+            if (ch == L'p') {
+                Print(L"previous\r\n");
+                return BOOT_KERNEL_PREVIOUS;
+            }
+            if (ch == L'\r' || ch == L'\n' || ch == L' ') {
+                Print(L"normal\r\n");
+                return BOOT_KERNEL_NORMAL;
+            }
+        }
+
+        if (waited_ms >= BOOT_MENU_TIMEOUT_MS) {
+            Print(L"normal\r\n");
+            return BOOT_KERNEL_NORMAL;
+        }
+
+        uefi_call_wrapper(SystemTable->BootServices->Stall, 1, (UINTN)BOOT_MENU_POLL_MS * 1000u);
+        waited_ms += BOOT_MENU_POLL_MS;
+    }
+}
+
+static int gop_mode_is_usable(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* info) {
+    if (info == NULL) {
+        return 0;
+    }
+    if (info->HorizontalResolution == 0 || info->VerticalResolution == 0) {
+        return 0;
+    }
+    if (info->PixelFormat == PixelBltOnly) {
+        return 0;
+    }
+    return 1;
+}
+
+static int gop_mode_is_listable(const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* info) {
+    if (info == NULL) {
+        return 0;
+    }
+    return (info->HorizontalResolution != 0 && info->VerticalResolution != 0) ? 1 : 0;
+}
+
+static int gop_format_is_preferred(UINT32 format) {
+    return format == PixelBlueGreenRedReserved8BitPerColor ||
+           format == PixelRedGreenBlueReserved8BitPerColor;
+}
+
+static EFI_STATUS gop_select_mode(
+    EFI_SYSTEM_TABLE* SystemTable,
+    EFI_GRAPHICS_OUTPUT_PROTOCOL* gop,
+    boot_fb_mode_t* out_modes,
+    uint32_t out_modes_cap,
+    const gop_mode_pref_t* pref,
+    uint32_t* out_mode_count,
+    uint32_t* out_mode_total,
+    uint32_t* out_selected_mode
+) {
+    EFI_STATUS status;
+    UINT32 max_mode;
+    UINT32 current_mode;
+    UINT32 best_mode = 0u;
+    UINT32 best_width = 0u;
+    UINT32 best_height = 0u;
+    UINT8 best_preferred = 0u;
+    UINT64 best_area = 0u;
+    UINT8 best_valid = 0u;
+    UINT8 preferred_valid = 0u;
+    UINT32 preferred_mode = 0u;
+    uint32_t stored_count = 0u;
+
+    if (SystemTable == NULL || gop == NULL || gop->Mode == NULL ||
+        out_mode_count == NULL || out_mode_total == NULL || out_selected_mode == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    *out_mode_count = 0u;
+    *out_mode_total = 0u;
+    *out_selected_mode = 0u;
+
+    max_mode = gop->Mode->MaxMode;
+    current_mode = gop->Mode->Mode;
+    *out_mode_total = (uint32_t)max_mode;
+
+    for (UINT32 mode = 0; mode < max_mode; mode++) {
+        UINTN info_size = 0;
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* info = NULL;
+
+        status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &info_size, &info);
+        if (EFI_ERROR(status) || info == NULL) {
+            continue;
+        }
+
+        if (pref != NULL && pref->has_mode && mode == pref->mode) {
+            preferred_valid = 1u;
+            preferred_mode = mode;
+        }
+
+        if (gop_mode_is_listable(info)) {
+            if (out_modes != NULL && stored_count < out_modes_cap) {
+                out_modes[stored_count].mode = (uint32_t)mode;
+                out_modes[stored_count].width = (uint32_t)info->HorizontalResolution;
+                out_modes[stored_count].height = (uint32_t)info->VerticalResolution;
+                out_modes[stored_count].pixels_per_scanline = (uint32_t)info->PixelsPerScanLine;
+                out_modes[stored_count].format = (uint32_t)info->PixelFormat;
+                stored_count++;
+            }
+        }
+
+        if (gop_mode_is_usable(info)) {
+            UINT8 preferred = (UINT8)gop_format_is_preferred(info->PixelFormat);
+            UINT64 area = (UINT64)info->HorizontalResolution * (UINT64)info->VerticalResolution;
+
+            if (!best_valid ||
+                preferred > best_preferred ||
+                (preferred == best_preferred && area > best_area) ||
+                (preferred == best_preferred && area == best_area && info->HorizontalResolution > best_width) ||
+                (preferred == best_preferred && area == best_area && info->HorizontalResolution == best_width &&
+                 info->VerticalResolution > best_height) ||
+                (preferred == best_preferred && area == best_area && info->HorizontalResolution == best_width &&
+                 info->VerticalResolution == best_height && mode < best_mode)) {
+                best_valid = 1u;
+                best_mode = mode;
+                best_width = info->HorizontalResolution;
+                best_height = info->VerticalResolution;
+                best_preferred = preferred;
+                best_area = area;
+            }
+        }
+
+        uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, info);
+    }
+
+    if (stored_count == 0u && gop_mode_is_listable(gop->Mode->Info) && out_modes != NULL && out_modes_cap > 0u) {
+        out_modes[0].mode = (uint32_t)current_mode;
+        out_modes[0].width = (uint32_t)gop->Mode->Info->HorizontalResolution;
+        out_modes[0].height = (uint32_t)gop->Mode->Info->VerticalResolution;
+        out_modes[0].pixels_per_scanline = (uint32_t)gop->Mode->Info->PixelsPerScanLine;
+        out_modes[0].format = (uint32_t)gop->Mode->Info->PixelFormat;
+        stored_count = 1u;
+    }
+
+    *out_mode_count = stored_count;
+    if (preferred_valid) {
+        *out_selected_mode = preferred_mode;
+    } else {
+        *out_selected_mode = best_valid ? (uint32_t)best_mode : (uint32_t)current_mode;
+    }
+
+    status = uefi_call_wrapper(gop->SetMode, 2, gop, (UINT32)*out_selected_mode);
+    if (EFI_ERROR(status)) {
+        if (*out_selected_mode != (uint32_t)current_mode) {
+            status = uefi_call_wrapper(gop->SetMode, 2, gop, current_mode);
+            if (!EFI_ERROR(status)) {
+                *out_selected_mode = (uint32_t)current_mode;
+                return EFI_SUCCESS;
+            }
+        }
+        return status;
+    }
+
+    return EFI_SUCCESS;
+}
+
+static uint8_t ascii_is_space(char c) {
+    return (c == ' ' || c == '\t' || c == '\r' || c == '\n') ? 1u : 0u;
+}
+
+static int parse_u32_ascii(const char* text, uint32_t len, uint32_t* out_value) {
+    uint64_t value = 0u;
+    uint32_t i = 0u;
+
+    if (!text || !out_value || len == 0u) {
+        return -1;
+    }
+    while (i < len && ascii_is_space(text[i])) {
+        i++;
+    }
+    if (i >= len) {
+        return -1;
+    }
+    while (i < len && !ascii_is_space(text[i])) {
+        if (text[i] < '0' || text[i] > '9') {
+            return -1;
+        }
+        value = value * 10u + (uint64_t)(text[i] - '0');
+        if (value > 0xFFFFFFFFull) {
+            return -1;
+        }
+        i++;
+    }
+    while (i < len && ascii_is_space(text[i])) {
+        i++;
+    }
+    if (i != len) {
+        return -1;
+    }
+    *out_value = (uint32_t)value;
+    return 0;
+}
+
+static int parse_mode_pref_from_buffer(const uint8_t* data, UINTN size, gop_mode_pref_t* out_pref) {
+    UINTN pos = 0u;
+
+    if (!data || !out_pref) {
+        return -1;
+    }
+    out_pref->has_mode = 0u;
+    out_pref->mode = 0u;
+
+    while (pos < size) {
+        UINTN line_start = pos;
+        UINTN line_end = pos;
+
+        while (line_end < size && data[line_end] != '\n' && data[line_end] != '\r') {
+            line_end++;
+        }
+        pos = line_end;
+        while (pos < size && (data[pos] == '\n' || data[pos] == '\r')) {
+            pos++;
+        }
+
+        while (line_start < line_end && ascii_is_space((char)data[line_start])) {
+            line_start++;
+        }
+        while (line_end > line_start && ascii_is_space((char)data[line_end - 1u])) {
+            line_end--;
+        }
+        if (line_end <= line_start) {
+            continue;
+        }
+        if (data[line_start] == '#') {
+            continue;
+        }
+
+        if ((UINTN)(line_end - line_start) >= 5u &&
+            data[line_start + 0u] == 'm' &&
+            data[line_start + 1u] == 'o' &&
+            data[line_start + 2u] == 'd' &&
+            data[line_start + 3u] == 'e' &&
+            data[line_start + 4u] == '=') {
+            const char* value = (const char*)(data + line_start + 5u);
+            uint32_t value_len = (uint32_t)(line_end - (line_start + 5u));
+            uint32_t parsed_mode = 0u;
+
+            if (value_len == 4u &&
+                value[0] == 'a' && value[1] == 'u' && value[2] == 't' && value[3] == 'o') {
+                out_pref->has_mode = 0u;
+                out_pref->mode = 0u;
+                return 0;
+            }
+            if (parse_u32_ascii(value, value_len, &parsed_mode) == 0) {
+                out_pref->has_mode = 1u;
+                out_pref->mode = parsed_mode;
+                return 0;
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static EFI_STATUS load_gop_mode_preference_from_variable(
+    EFI_SYSTEM_TABLE* SystemTable,
+    gop_mode_pref_t* out_pref
+) {
+    EFI_STATUS status;
+    UINT32 attrs = 0u;
+    UINTN data_size = sizeof(UINT32);
+    UINT32 value = 0u;
+
+    if (!SystemTable || !out_pref || !SystemTable->RuntimeServices || !SystemTable->RuntimeServices->GetVariable) {
+        return EFI_UNSUPPORTED;
+    }
+
+    status = uefi_call_wrapper(
+        SystemTable->RuntimeServices->GetVariable,
+        5,
+        gop_pref_var_name,
+        &gop_pref_var_guid,
+        &attrs,
+        &data_size,
+        &value
+    );
+    if (EFI_ERROR(status)) {
+        return status;
+    }
+    if (data_size != sizeof(UINT32)) {
+        return EFI_COMPROMISED_DATA;
+    }
+
+    if (value == 0xFFFFFFFFu) {
+        out_pref->has_mode = 0u;
+        out_pref->mode = 0u;
+    } else {
+        out_pref->has_mode = 1u;
+        out_pref->mode = value;
+    }
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS load_gop_mode_preference(
+    EFI_HANDLE ImageHandle,
+    EFI_SYSTEM_TABLE* SystemTable,
+    gop_mode_pref_t* out_pref
+) {
+    EFI_STATUS status;
+    EFI_LOADED_IMAGE_PROTOCOL* loaded_image = NULL;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* simple_fs = NULL;
+    EFI_FILE_PROTOCOL* root = NULL;
+    const CHAR16* pref_paths[] = {
+        L"\\myares.cfg",
+        L"\\EFI\\BOOT\\myares.cfg",
+        L"\\myaos.resolution.cfg",
+        L"\\EFI\\BOOT\\myaos.resolution.cfg",
+    };
+
+    if (!out_pref) {
+        return EFI_INVALID_PARAMETER;
+    }
+    out_pref->has_mode = 0u;
+    out_pref->mode = 0u;
+
+    status = load_gop_mode_preference_from_variable(SystemTable, out_pref);
+    if (!EFI_ERROR(status)) {
+        return EFI_SUCCESS;
+    }
+
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->HandleProtocol,
+        3,
+        ImageHandle,
+        &loaded_image_guid,
+        (void**)&loaded_image
+    );
+    if (EFI_ERROR(status) || loaded_image == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->HandleProtocol,
+        3,
+        loaded_image->DeviceHandle,
+        &simple_fs_guid,
+        (void**)&simple_fs
+    );
+    if (EFI_ERROR(status) || simple_fs == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    status = uefi_call_wrapper(simple_fs->OpenVolume, 2, simple_fs, &root);
+    if (EFI_ERROR(status) || root == NULL) {
+        return status;
+    }
+
+    for (UINTN i = 0u; i < sizeof(pref_paths) / sizeof(pref_paths[0]); i++) {
+        EFI_FILE_PROTOCOL* file = NULL;
+        void* pref_buf = NULL;
+        UINTN pref_size = 0u;
+
+        status = uefi_call_wrapper(
+            root->Open,
+            5,
+            root,
+            &file,
+            (CHAR16*)pref_paths[i],
+            EFI_FILE_MODE_READ,
+            0
+        );
+        if (EFI_ERROR(status) || file == NULL) {
+            continue;
+        }
+
+        status = read_open_file_to_buffer(SystemTable, file, &pref_buf, &pref_size);
+        uefi_call_wrapper(file->Close, 1, file);
+        if (EFI_ERROR(status) || pref_buf == NULL || pref_size == 0u) {
+            continue;
+        }
+
+        if (parse_mode_pref_from_buffer((const uint8_t*)pref_buf, pref_size, out_pref) == 0) {
+            uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, pref_buf);
+            uefi_call_wrapper(root->Close, 1, root);
+            return EFI_SUCCESS;
+        }
+
+        uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, pref_buf);
+    }
+
+    uefi_call_wrapper(root->Close, 1, root);
+    return EFI_NOT_FOUND;
 }
 
 static EFI_STATUS get_memory_map_alloc(
@@ -229,24 +752,6 @@ static EFI_STATUS exit_boot_services_with_retry(
         uefi_call_wrapper(SystemTable->BootServices->FreePool, 1, mmap);
     }
     return status;
-}
-
-static CHAR16 char16_to_lower(CHAR16 c) {
-    if (c >= L'A' && c <= L'Z') {
-        return (CHAR16)(c - L'A' + L'a');
-    }
-    return c;
-}
-
-static int str16_eq_ci(const CHAR16* a, const CHAR16* b) {
-    UINTN i = 0;
-    while (a[i] != 0 && b[i] != 0) {
-        if (char16_to_lower(a[i]) != char16_to_lower(b[i])) {
-            return 0;
-        }
-        i++;
-    }
-    return a[i] == b[i];
 }
 
 static EFI_STATUS build_sibling_kernel_path(
@@ -670,9 +1175,54 @@ static EFI_STATUS read_kernel_from_root(
     return read_kernel_recursive(SystemTable, root, 0, kernel_buffer_out, kernel_size_out);
 }
 
+static EFI_STATUS read_previous_kernel_from_root(
+    EFI_SYSTEM_TABLE* SystemTable,
+    EFI_FILE_PROTOCOL* root,
+    void** kernel_buffer_out,
+    UINTN* kernel_size_out
+) {
+    EFI_STATUS status;
+    const CHAR16* prev_paths[] = {
+        L"\\kernel.prev.elf",
+        L"\\KERNEL.PREV.ELF",
+        L"\\KERNELPR.ELF",
+        L"\\EFI\\BOOT\\kernel.prev.elf",
+        L"\\EFI\\BOOT\\KERNEL.PREV.ELF",
+        L"kernel.prev.elf",
+        L"KERNEL.PREV.ELF",
+        L"KERNELPR.ELF",
+        L"EFI\\BOOT\\kernel.prev.elf",
+        L"EFI\\BOOT\\KERNEL.PREV.ELF",
+    };
+
+    for (UINTN i = 0; i < sizeof(prev_paths) / sizeof(prev_paths[0]); i++) {
+        EFI_FILE_PROTOCOL* kernel_file = NULL;
+        status = uefi_call_wrapper(
+            root->Open,
+            5,
+            root,
+            &kernel_file,
+            (CHAR16*)prev_paths[i],
+            EFI_FILE_MODE_READ,
+            0
+        );
+        if (EFI_ERROR(status) || kernel_file == NULL) {
+            continue;
+        }
+        status = read_open_file_to_buffer(SystemTable, kernel_file, kernel_buffer_out, kernel_size_out);
+        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
+        if (!EFI_ERROR(status)) {
+            return EFI_SUCCESS;
+        }
+    }
+
+    return EFI_NOT_FOUND;
+}
+
 static EFI_STATUS load_kernel_file(
     EFI_HANDLE ImageHandle,
     EFI_SYSTEM_TABLE* SystemTable,
+    boot_kernel_choice_t kernel_choice,
     void** kernel_buffer_out,
     UINTN* kernel_size_out
 ) {
@@ -720,13 +1270,21 @@ static EFI_STATUS load_kernel_file(
                 dbg_putc('j');
             }
             if (!EFI_ERROR(status) && root != NULL) {
-                status = read_kernel_from_root(
-                    SystemTable,
-                    root,
-                    preferred_kernel_path,
-                    kernel_buffer_out,
-                    kernel_size_out
-                );
+                if (kernel_choice == BOOT_KERNEL_PREVIOUS) {
+                    status = read_previous_kernel_from_root(SystemTable, root, kernel_buffer_out, kernel_size_out);
+                    if (EFI_ERROR(status)) {
+                        Print(L"previous kernel not found on boot volume, trying normal kernel\r\n");
+                    }
+                }
+                if (EFI_ERROR(status) || kernel_choice == BOOT_KERNEL_NORMAL) {
+                    status = read_kernel_from_root(
+                        SystemTable,
+                        root,
+                        preferred_kernel_path,
+                        kernel_buffer_out,
+                        kernel_size_out
+                    );
+                }
                 uefi_call_wrapper(root->Close, 1, root);
                 if (!EFI_ERROR(status)) {
                     if (preferred_kernel_path != NULL) {
@@ -780,13 +1338,26 @@ static EFI_STATUS load_kernel_file(
             continue;
         }
 
-        status = read_kernel_from_root(
-            SystemTable,
-            root,
-            preferred_kernel_path,
-            kernel_buffer_out,
-            kernel_size_out
-        );
+        if (kernel_choice == BOOT_KERNEL_PREVIOUS) {
+            status = read_previous_kernel_from_root(SystemTable, root, kernel_buffer_out, kernel_size_out);
+            if (EFI_ERROR(status)) {
+                status = read_kernel_from_root(
+                    SystemTable,
+                    root,
+                    preferred_kernel_path,
+                    kernel_buffer_out,
+                    kernel_size_out
+                );
+            }
+        } else {
+            status = read_kernel_from_root(
+                SystemTable,
+                root,
+                preferred_kernel_path,
+                kernel_buffer_out,
+                kernel_size_out
+            );
+        }
         uefi_call_wrapper(root->Close, 1, root);
 
         if (!EFI_ERROR(status)) {
@@ -1109,7 +1680,14 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     dbg_putc('A');
 
     EFI_STATUS status;
+    uint64_t acpi_rsdp = 0;
+    uint32_t acpi_revision = 0u;
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = NULL;
+    boot_fb_mode_t fb_modes[BOOT_MAX_FB_MODES];
+    uint32_t fb_mode_count = 0u;
+    uint32_t fb_mode_total = 0u;
+    uint32_t fb_mode = 0u;
+    gop_mode_pref_t fb_pref;
 
     status = uefi_call_wrapper(
         SystemTable->BootServices->LocateProtocol,
@@ -1124,14 +1702,20 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
 
     dbg_putc('B');
 
-    status = uefi_call_wrapper(
-        gop->SetMode,
-        2,
+    (void)load_gop_mode_preference(ImageHandle, SystemTable, &fb_pref);
+
+    status = gop_select_mode(
+        SystemTable,
         gop,
-        gop->Mode->Mode
+        fb_modes,
+        BOOT_MAX_FB_MODES,
+        &fb_pref,
+        &fb_mode_count,
+        &fb_mode_total,
+        &fb_mode
     );
     if (EFI_ERROR(status)) {
-        fatal(SystemTable, L"SetMode failed", status);
+        fatal(SystemTable, L"GOP mode setup failed", status);
     }
 
     dbg_putc('C');
@@ -1171,6 +1755,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
         fatal(SystemTable, L"boot_info alloc failed", status);
     }
     uefi_call_wrapper(SystemTable->BootServices->SetMem, 3, boot_info, sizeof(boot_info_t), 0);
+    find_acpi_rsdp(SystemTable, &acpi_rsdp, &acpi_revision);
 
     dbg_putc('K');
 
@@ -1281,9 +1866,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
 
     void* kernel_file_buffer = NULL;
     UINTN kernel_file_size = 0;
+    boot_kernel_choice_t kernel_choice = BOOT_KERNEL_NORMAL;
+    kernel_choice = boot_choose_kernel(SystemTable);
     status = load_kernel_file(
         ImageHandle,
         SystemTable,
+        kernel_choice,
         &kernel_file_buffer,
         &kernel_file_size
     );
@@ -1329,7 +1917,16 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
     boot_info->desc_size = (uint64_t)final_desc_size;
     boot_info->boot_disk_base = (uint64_t)boot_disk_base;
     boot_info->boot_disk_size = (uint64_t)boot_disk_size;
-    boot_info->efi_reset_system = (uint64_t)(UINTN)SystemTable->RuntimeServices->ResetSystem;
+    boot_info->efi_reset_system = (uint64_t)(UINTN)(
+        SystemTable->RuntimeServices ? SystemTable->RuntimeServices->ResetSystem : NULL
+    );
+    boot_info->efi_get_variable = (uint64_t)(UINTN)(
+        SystemTable->RuntimeServices ? SystemTable->RuntimeServices->GetVariable : NULL
+    );
+    boot_info->efi_set_variable = (uint64_t)(UINTN)(
+        SystemTable->RuntimeServices ? SystemTable->RuntimeServices->SetVariable : NULL
+    );
+    boot_info->acpi_rsdp = acpi_rsdp;
     boot_info->efi_block_io = (uint64_t)(UINTN)boot_block_io;
     boot_info->boot_disk_lba_start = 0;
     boot_info->boot_disk_block_count = (uint64_t)boot_disk_block_count;
@@ -1339,6 +1936,13 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
         ? (uint32_t)boot_block_io->Media->ReadOnly
         : 1u;
     boot_info->boot_services_active = 0u;
+    boot_info->fb_mode = fb_mode;
+    boot_info->acpi_revision = acpi_revision;
+    boot_info->fb_mode_count = fb_mode_count;
+    boot_info->fb_mode_total = fb_mode_total;
+    for (uint32_t i = 0u; i < fb_mode_count && i < BOOT_MAX_FB_MODES; i++) {
+        boot_info->fb_modes[i] = fb_modes[i];
+    }
 
     dbg_putc('L');
 

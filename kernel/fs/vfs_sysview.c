@@ -39,11 +39,29 @@ static const char* g_config_files[] = {
     "fb_stride",
     "fb_format",
     "fb_size",
+    "fb_mode",
+    "fb_mode_count",
+    "fb_mode_total",
+    "fb_modes",
     "abi_version",
     "net_tx_packets",
     "net_rx_packets",
     "net_dropped_packets",
     "net_socket_count",
+    "net_src_ip",
+    "net_gateway_ip",
+    "net_dns_ip",
+    "net_if_name",
+    "net_driver",
+    "net_nic_model",
+    "net_nic_state",
+    "net_nic_note",
+    "net_nic_firmware_state",
+    "net_nic_firmware_path",
+    "net_nic_pci_bdf",
+    "net_nic_pci_id",
+    "net_nic_detected",
+    "net_nic_supported",
     "modules_total",
     "modules_loaded",
     "init_steps_total",
@@ -191,6 +209,12 @@ static void tb_append(text_builder_t* tb, const char* text) {
         tb->buf[tb->len++] = text[i];
     }
     tb->buf[tb->len] = '\0';
+}
+
+static void tb_append_u32(text_builder_t* tb, uint32_t value) {
+    char num[16];
+    u32_to_dec(value, num, sizeof(num));
+    tb_append(tb, num);
 }
 
 static void tb_append_kv_u32(text_builder_t* tb, const char* key, uint32_t value) {
@@ -517,6 +541,48 @@ static int read_config_file(const char* path, uint8_t* out_buf, uint32_t out_buf
     if (str_eq(path, "/fb_size")) {
         return emit_u64(out_buf, out_buf_size, out_size, boot ? boot->fb.size : 0u);
     }
+    if (str_eq(path, "/fb_mode")) {
+        return emit_u64(out_buf, out_buf_size, out_size, boot ? boot->fb_mode : 0u);
+    }
+    if (str_eq(path, "/fb_mode_count")) {
+        return emit_u64(out_buf, out_buf_size, out_size, boot ? boot->fb_mode_count : 0u);
+    }
+    if (str_eq(path, "/fb_mode_total")) {
+        return emit_u64(out_buf, out_buf_size, out_size, boot ? boot->fb_mode_total : 0u);
+    }
+    if (str_eq(path, "/fb_modes")) {
+        char text[2048];
+        text_builder_t tb;
+        tb_init(&tb, text, sizeof(text));
+
+        if (!boot || boot->fb_mode_count == 0u) {
+            tb_append(&tb, "none\n");
+        } else {
+            uint32_t count = boot->fb_mode_count;
+            if (count > BOOT_MAX_FB_MODES) {
+                count = BOOT_MAX_FB_MODES;
+            }
+
+            for (uint32_t i = 0; i < count; i++) {
+                const boot_fb_mode_t* mode = &boot->fb_modes[i];
+                tb_append(&tb, "mode=");
+                tb_append_u32(&tb, mode->mode);
+                if (mode->mode == boot->fb_mode) {
+                    tb_append(&tb, " current");
+                }
+                tb_append(&tb, " ");
+                tb_append_u32(&tb, mode->width);
+                tb_append(&tb, "x");
+                tb_append_u32(&tb, mode->height);
+                tb_append(&tb, " stride=");
+                tb_append_u32(&tb, mode->pixels_per_scanline);
+                tb_append(&tb, " fmt=");
+                tb_append_u32(&tb, mode->format);
+                tb_append(&tb, "\n");
+            }
+        }
+        return emit_text(out_buf, out_buf_size, out_size, text);
+    }
     if (str_eq(path, "/abi_version")) {
         return emit_u64(out_buf, out_buf_size, out_size, MYAOS_ABI_VERSION);
     }
@@ -531,6 +597,48 @@ static int read_config_file(const char* path, uint8_t* out_buf, uint32_t out_buf
     }
     if (str_eq(path, "/net_socket_count")) {
         return emit_u64(out_buf, out_buf_size, out_size, net.socket_count);
+    }
+    if (str_eq(path, "/net_src_ip")) {
+        return emit_u64(out_buf, out_buf_size, out_size, net_default_src_ip());
+    }
+    if (str_eq(path, "/net_gateway_ip")) {
+        return emit_u64(out_buf, out_buf_size, out_size, net_default_gateway_ip());
+    }
+    if (str_eq(path, "/net_dns_ip")) {
+        return emit_u64(out_buf, out_buf_size, out_size, net_default_dns_ip());
+    }
+    if (str_eq(path, "/net_if_name")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_if_name());
+    }
+    if (str_eq(path, "/net_driver")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_driver_name());
+    }
+    if (str_eq(path, "/net_nic_model")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_model());
+    }
+    if (str_eq(path, "/net_nic_state")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_state());
+    }
+    if (str_eq(path, "/net_nic_note")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_note());
+    }
+    if (str_eq(path, "/net_nic_firmware_state")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_firmware_state());
+    }
+    if (str_eq(path, "/net_nic_firmware_path")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_firmware_path());
+    }
+    if (str_eq(path, "/net_nic_pci_bdf")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_pci_bdf());
+    }
+    if (str_eq(path, "/net_nic_pci_id")) {
+        return emit_text(out_buf, out_buf_size, out_size, net_nic_pci_id());
+    }
+    if (str_eq(path, "/net_nic_detected")) {
+        return emit_u64(out_buf, out_buf_size, out_size, net_nic_detected_count());
+    }
+    if (str_eq(path, "/net_nic_supported")) {
+        return emit_u64(out_buf, out_buf_size, out_size, net_nic_supported_count());
     }
     if (str_eq(path, "/modules_total")) {
         return emit_u64(out_buf, out_buf_size, out_size, module_count());

@@ -1,2 +1,2 @@
 /bin/fbinfo.elf
-show framebuffer interface info
+show framebuffer info and UEFI GOP modes

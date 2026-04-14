@@ -69,7 +69,8 @@ make test-runtime
 
 - User-space dynamic loader helpers: `programs/lib/dynload.h`
 - Demo shared library source: `programs/shared/libdemo.c`
-- Built shared object path in image: `/lib/libdemo.so`
+- Relocation/extern-symbol demo shared library: `programs/shared/liblinkdemo.c`
+- Built shared object paths in image: `/lib/libdemo.so`, `/lib/liblinkdemo.so`
 - Validation command: `dlcheck`
 
 ## Modules and Optional Components

@@ -20,6 +20,9 @@
 #define SHELL_HELP_TEXT_MAX (64u * 1024u)
 #define SHELL_REDIRECT_MAX_FILE (256u * 1024u)
 #define SHELL_CURSOR_BLINK_TICKS 20u
+#define SHELL_HISTORY_MAX 64u
+#define SHELL_HISTORY_FILE_MAX (64u * 1024u)
+#define SHELL_HISTORY_PATH "/var/log/shell_history.log"
 
 typedef struct {
     uint8_t used;
@@ -33,10 +36,17 @@ static uint32_t g_input_len;
 static uint32_t g_input_cursor;
 static char g_last_command[SHELL_INPUT_MAX];
 static uint8_t g_has_last_command;
+static char g_history[SHELL_HISTORY_MAX][SHELL_INPUT_MAX];
+static uint32_t g_history_start;
+static uint32_t g_history_count;
+static int32_t g_history_nav;
+static char g_history_saved_input[SHELL_INPUT_MAX];
+static uint8_t g_history_saved_valid;
 static uint8_t g_prompt_shown;
 static uint32_t g_pipe_seq;
 static uint8_t g_debug_mode;
 static uint8_t g_autorun_done;
+static uint8_t g_recovery_mode;
 static uint32_t g_rendered_input_len;
 static uint8_t g_cursor_visible;
 static uint64_t g_cursor_last_blink_tick;
@@ -46,6 +56,8 @@ static uint8_t g_cursor_overlay_active;
 static uint32_t g_cursor_overlay_col;
 static uint32_t g_cursor_overlay_row;
 static uint32_t g_cursor_overlay_index;
+static int32_t g_last_status;
+static uint8_t g_verbose_mode;
 static shell_manifest_cache_entry_t g_manifest_cache[SHELL_MANIFEST_CACHE_MAX];
 
 static int64_t syscall_invoke(
@@ -163,6 +175,40 @@ static int str_contains_char(const char* text, char c) {
     return 0;
 }
 
+static int str_contains(const char* text, const char* needle) {
+    size_t text_len = str_len(text);
+    size_t needle_len = str_len(needle);
+
+    if (!needle || !needle[0]) {
+        return 1;
+    }
+    if (!text || needle_len > text_len) {
+        return 0;
+    }
+
+    for (size_t i = 0; i + needle_len <= text_len; i++) {
+        size_t j = 0;
+        while (j < needle_len && text[i + j] == needle[j]) {
+            j++;
+        }
+        if (j == needle_len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int str_starts_with_ci(const char* text, const char* prefix) {
+    size_t i = 0;
+    while (prefix[i]) {
+        if (to_lower_char(text[i]) != to_lower_char(prefix[i])) {
+            return 0;
+        }
+        i++;
+    }
+    return 1;
+}
+
 static void to_lower(char* text) {
     for (size_t i = 0; text[i]; i++) {
         if (text[i] >= 'A' && text[i] <= 'Z') {
@@ -189,6 +235,103 @@ static void trim_in_place(char* text) {
     text[out] = '\0';
 }
 
+static uint32_t shell_utf8_char_len_at(const char* text, uint32_t len, uint32_t pos) {
+    uint8_t b0;
+
+    if (!text || pos >= len) {
+        return 0u;
+    }
+
+    b0 = (uint8_t)text[pos];
+    if (b0 < 0x80u) {
+        return 1u;
+    }
+
+    if (b0 >= 0xC2u && b0 <= 0xDFu) {
+        if (pos + 1u < len && (((uint8_t)text[pos + 1u] & 0xC0u) == 0x80u)) {
+            return 2u;
+        }
+        return 1u;
+    }
+
+    if (b0 >= 0xE0u && b0 <= 0xEFu) {
+        uint8_t b1;
+        uint8_t b2;
+        if (pos + 2u >= len) {
+            return 1u;
+        }
+        b1 = (uint8_t)text[pos + 1u];
+        b2 = (uint8_t)text[pos + 2u];
+        if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u) {
+            return 1u;
+        }
+        if ((b0 == 0xE0u && b1 < 0xA0u) || (b0 == 0xEDu && b1 >= 0xA0u)) {
+            return 1u;
+        }
+        return 3u;
+    }
+
+    if (b0 >= 0xF0u && b0 <= 0xF4u) {
+        uint8_t b1;
+        uint8_t b2;
+        uint8_t b3;
+        if (pos + 3u >= len) {
+            return 1u;
+        }
+        b1 = (uint8_t)text[pos + 1u];
+        b2 = (uint8_t)text[pos + 2u];
+        b3 = (uint8_t)text[pos + 3u];
+        if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u || (b3 & 0xC0u) != 0x80u) {
+            return 1u;
+        }
+        if ((b0 == 0xF0u && b1 < 0x90u) || (b0 == 0xF4u && b1 > 0x8Fu)) {
+            return 1u;
+        }
+        return 4u;
+    }
+
+    return 1u;
+}
+
+static uint32_t shell_utf8_prev_start(const char* text, uint32_t pos) {
+    if (!text || pos == 0u) {
+        return 0u;
+    }
+
+    pos--;
+    while (pos > 0u && (((uint8_t)text[pos] & 0xC0u) == 0x80u)) {
+        pos--;
+    }
+    return pos;
+}
+
+static uint32_t shell_utf8_next_start(const char* text, uint32_t len, uint32_t pos) {
+    uint32_t step = shell_utf8_char_len_at(text, len, pos);
+    if (step == 0u) {
+        return len;
+    }
+    pos += step;
+    if (pos > len) {
+        pos = len;
+    }
+    return pos;
+}
+
+static uint32_t shell_utf8_cell_count(const char* text, uint32_t bytes) {
+    uint32_t i = 0u;
+    uint32_t cells = 0u;
+
+    while (i < bytes) {
+        uint32_t step = shell_utf8_char_len_at(text, bytes, i);
+        if (step == 0u) {
+            break;
+        }
+        i += step;
+        cells++;
+    }
+    return cells;
+}
+
 typedef struct {
     char* argv[SHELL_ARGV_MAX];
     int argc;
@@ -196,6 +339,14 @@ typedef struct {
     uint8_t out_append;
     char out_path[MYAOS_PATH_MAX];
 } shell_cmd_t;
+
+typedef enum {
+    SHELL_EXEC_PROBE_OK = 0,
+    SHELL_EXEC_PROBE_INVALID_PATH = 1,
+    SHELL_EXEC_PROBE_IS_DIR = 2,
+    SHELL_EXEC_PROBE_NO_EXEC = 3,
+    SHELL_EXEC_PROBE_NOT_FOUND = 4,
+} shell_exec_probe_t;
 
 static int is_space(char c) {
     return c == ' ' || c == '\t';
@@ -223,6 +374,23 @@ static void u32_to_dec(uint32_t value, char* out, size_t out_size) {
         out[pos++] = rev[--n];
     }
     out[pos] = '\0';
+}
+
+static void i32_to_dec(int32_t value, char* out, size_t out_size) {
+    if (!out || out_size == 0u) {
+        return;
+    }
+    if (value < 0) {
+        uint32_t mag = (uint32_t)(~(uint32_t)value) + 1u;
+        if (out_size < 3u) {
+            out[0] = '\0';
+            return;
+        }
+        out[0] = '-';
+        u32_to_dec(mag, out + 1, out_size - 1u);
+    } else {
+        u32_to_dec((uint32_t)value, out, out_size);
+    }
 }
 
 static int append_text(char* out, size_t out_size, size_t* io_pos, const char* text) {
@@ -666,6 +834,9 @@ static int read_command_manifest(const char* cmd, char* exec_path, size_t exec_s
     return exec_path[0] ? 0 : -1;
 }
 
+static int shell_spawn_command(const shell_cmd_t* cmd, int32_t* out_exit_code);
+static int make_pipe_temp_path(char* out, size_t out_size);
+
 static int shell_help(const shell_cmd_t* cmd) {
     myaos_dirent_t entries[SHELL_HELP_LIST_MAX];
     char shown_names[SHELL_HELP_SEEN_MAX][MYAOS_NAME_MAX];
@@ -679,6 +850,18 @@ static int shell_help(const shell_cmd_t* cmd) {
     uint8_t manifest_listed = 0u;
     uint8_t elf_listed = 0u;
     uint8_t truncated = 0u;
+    const char* pattern = NULL;
+    uint8_t use_pager = 0u;
+
+    if (cmd) {
+        for (int ai = 1; ai < cmd->argc; ai++) {
+            if (str_eq(cmd->argv[ai], "--pager") || str_eq(cmd->argv[ai], "-p")) {
+                use_pager = 1u;
+            } else if (!pattern) {
+                pattern = cmd->argv[ai];
+            }
+        }
+    }
 
 #define HELP_APPEND_TEXT(text_literal)                                                        \
     do {                                                                                      \
@@ -688,12 +871,30 @@ static int shell_help(const shell_cmd_t* cmd) {
     } while (0)
 
     out_text[0] = '\0';
-    HELP_APPEND_TEXT("help - show commands\n");
-    HELP_APPEND_TEXT("cd - change shell directory\n");
-    HELP_APPEND_TEXT("debug - shell debug [on|off|toggle]\n");
-    HELP_APPEND_TEXT("autorun - run /autorun.sh, /boot/autorun.sh, or /ram/autorun.sh\n");
-    HELP_APPEND_TEXT("load - run ELF directly: load <path.elf> [args...]\n");
-    HELP_APPEND_TEXT("./name.sh - execute script from current directory\n");
+    if (!pattern || str_contains("help", pattern) || str_contains("show commands", pattern)) {
+        HELP_APPEND_TEXT("help - show commands\n");
+    }
+    if (!pattern || str_contains("history", pattern)) {
+        HELP_APPEND_TEXT("history - show command history [pattern]\n");
+    }
+    if (!pattern || str_contains("cd", pattern)) {
+        HELP_APPEND_TEXT("cd - change shell directory\n");
+    }
+    if (!pattern || str_contains("debug", pattern)) {
+        HELP_APPEND_TEXT("debug - shell debug [on|off|toggle]\n");
+    }
+    if (!pattern || str_contains("verbose", pattern)) {
+        HELP_APPEND_TEXT("verbose - print command exit code details [on|off|toggle]\n");
+    }
+    if (!pattern || str_contains("autorun", pattern)) {
+        HELP_APPEND_TEXT("autorun - run /autorun.sh, /boot/autorun.sh, or /ram/autorun.sh\n");
+    }
+    if (!pattern || str_contains("load", pattern)) {
+        HELP_APPEND_TEXT("load - run ELF directly: load <path.elf> [args...]\n");
+    }
+    if (!pattern || str_contains("script", pattern) || str_contains(".sh", pattern)) {
+        HELP_APPEND_TEXT("./name.sh - execute script from current directory\n");
+    }
 
     if (vfs_list(scheduler_current_cwd(), manifest_dir, entries, SHELL_HELP_LIST_MAX, &count) != 0 || count == 0u) {
         manifest_dir = "/boot/cmd";
@@ -715,6 +916,12 @@ static int shell_help(const shell_cmd_t* cmd) {
                 continue;
             }
             if (read_command_manifest(name, exec_path, sizeof(exec_path), desc, sizeof(desc)) != 0) {
+                continue;
+            }
+            if (pattern && pattern[0] &&
+                !str_contains(name, pattern) &&
+                !str_contains(desc, pattern) &&
+                !str_contains(exec_path, pattern)) {
                 continue;
             }
 
@@ -753,6 +960,11 @@ static int shell_help(const shell_cmd_t* cmd) {
             if (build_child_path(elf_dir, entries[i].name, exec_path, sizeof(exec_path)) != 0) {
                 continue;
             }
+            if (pattern && pattern[0] &&
+                !str_contains(name, pattern) &&
+                !str_contains(exec_path, pattern)) {
+                continue;
+            }
 
             HELP_APPEND_TEXT(name);
             HELP_APPEND_TEXT(" - ELF program (use: load ");
@@ -777,6 +989,29 @@ static int shell_help(const shell_cmd_t* cmd) {
 
 #undef HELP_APPEND_TEXT
 
+    if (use_pager && (!cmd || !cmd->out_path[0])) {
+        char tmp_path[MYAOS_PATH_MAX];
+        shell_cmd_t pager_cmd;
+        char* pager_argv[2];
+        int32_t pager_exit = 0;
+
+        if (make_pipe_temp_path(tmp_path, sizeof(tmp_path)) == 0 &&
+            vfs_write_file("/", tmp_path, (const uint8_t*)out_text, (uint32_t)out_pos) == 0) {
+            pager_cmd.argc = 2;
+            pager_cmd.background = 0u;
+            pager_cmd.out_append = 0u;
+            pager_cmd.out_path[0] = '\0';
+            pager_argv[0] = "less";
+            pager_argv[1] = tmp_path;
+            pager_cmd.argv[0] = pager_argv[0];
+            pager_cmd.argv[1] = pager_argv[1];
+            (void)shell_spawn_command(&pager_cmd, &pager_exit);
+            (void)vfs_remove("/", tmp_path);
+            return pager_exit;
+        }
+        console_write("help: pager fallback failed\n");
+    }
+
     if (shell_output_blob(cmd, (const uint8_t*)out_text, (uint32_t)out_pos) != 0) {
         console_write("help: write failed\n");
         if (cmd && cmd->out_path[0]) {
@@ -789,24 +1024,345 @@ static int shell_help(const shell_cmd_t* cmd) {
     return 0;
 }
 
-static void shell_cd(int argc, char* const* argv) {
+static void shell_render_input(uint8_t show_cursor);
+static void shell_cursor_activity(void);
+static void shell_restore_cursor_overlay(void);
+
+static uint32_t shell_history_index(uint32_t pos) {
+    if (g_history_count == 0u) {
+        return 0u;
+    }
+    return (g_history_start + pos) % SHELL_HISTORY_MAX;
+}
+
+static const char* shell_history_get(uint32_t pos) {
+    if (pos >= g_history_count) {
+        return NULL;
+    }
+    return g_history[shell_history_index(pos)];
+}
+
+static void shell_history_add_runtime(const char* line) {
+    uint32_t index;
+
+    if (!line || !line[0]) {
+        return;
+    }
+
+    if (g_history_count > 0u) {
+        const char* last = shell_history_get(g_history_count - 1u);
+        if (last && str_eq(last, line)) {
+            return;
+        }
+    }
+
+    if (g_history_count < SHELL_HISTORY_MAX) {
+        index = shell_history_index(g_history_count);
+        g_history_count++;
+    } else {
+        index = g_history_start;
+        g_history_start = (g_history_start + 1u) % SHELL_HISTORY_MAX;
+    }
+
+    str_copy(g_history[index], line, sizeof(g_history[index]));
+}
+
+static void shell_history_save_persistent(const char* line) {
+    uint8_t* buf;
+    uint32_t size = 0u;
+    uint32_t line_len = (uint32_t)str_len(line);
+    uint32_t append_len;
+
+    if (!line || !line[0]) {
+        return;
+    }
+
+    buf = (uint8_t*)kmalloc(SHELL_HISTORY_FILE_MAX);
+    if (!buf) {
+        return;
+    }
+
+    if (vfs_read_file("/", SHELL_HISTORY_PATH, buf, SHELL_HISTORY_FILE_MAX - 1u, &size) != 0) {
+        size = 0u;
+    }
+
+    append_len = line_len + 1u;
+    if (size + append_len >= SHELL_HISTORY_FILE_MAX) {
+        uint32_t drop = (size + append_len) - (SHELL_HISTORY_FILE_MAX - 1u);
+        uint32_t keep_from = drop;
+
+        while (keep_from < size && buf[keep_from] != '\n') {
+            keep_from++;
+        }
+        if (keep_from < size && buf[keep_from] == '\n') {
+            keep_from++;
+        }
+
+        if (keep_from >= size) {
+            size = 0u;
+        } else {
+            uint32_t remain = size - keep_from;
+            for (uint32_t i = 0; i < remain; i++) {
+                buf[i] = buf[keep_from + i];
+            }
+            size = remain;
+        }
+    }
+
+    for (uint32_t i = 0; i < line_len && size + 1u < SHELL_HISTORY_FILE_MAX; i++) {
+        buf[size++] = (uint8_t)line[i];
+    }
+    if (size + 1u < SHELL_HISTORY_FILE_MAX) {
+        buf[size++] = '\n';
+    }
+    buf[size] = 0u;
+
+    (void)vfs_mkdir("/", "/var");
+    (void)vfs_mkdir("/", "/var/log");
+    (void)vfs_write_file("/", SHELL_HISTORY_PATH, buf, size);
+    kfree(buf);
+}
+
+static void shell_history_load_persistent(void) {
+    uint8_t* buf;
+    uint32_t size = 0u;
+    uint32_t line_start = 0u;
+
+    buf = (uint8_t*)kmalloc(SHELL_HISTORY_FILE_MAX);
+    if (!buf) {
+        return;
+    }
+    if (vfs_read_file("/", SHELL_HISTORY_PATH, buf, SHELL_HISTORY_FILE_MAX - 1u, &size) != 0) {
+        kfree(buf);
+        return;
+    }
+    buf[size] = 0u;
+
+    for (uint32_t i = 0; i <= size; i++) {
+        if (i == size || buf[i] == '\n' || buf[i] == '\r') {
+            char line[SHELL_INPUT_MAX];
+            uint32_t out = 0u;
+
+            for (uint32_t j = line_start; j < i && out + 1u < sizeof(line); j++) {
+                line[out++] = (char)buf[j];
+            }
+            line[out] = '\0';
+            trim_in_place(line);
+            if (line[0]) {
+                shell_history_add_runtime(line);
+            }
+            line_start = i + 1u;
+        }
+    }
+    kfree(buf);
+}
+
+static void shell_history_commit(const char* line) {
+    if (!line || !line[0]) {
+        return;
+    }
+    shell_history_add_runtime(line);
+    shell_history_save_persistent(line);
+}
+
+static int shell_history_builtin(const shell_cmd_t* cmd) {
+    static char out[SHELL_HELP_TEXT_MAX];
+    size_t pos = 0;
+    const char* pattern = NULL;
+    uint32_t shown = 0u;
+
+    if (cmd && cmd->argc >= 2) {
+        pattern = cmd->argv[1];
+    }
+
+    out[0] = '\0';
+    for (uint32_t i = 0; i < g_history_count; i++) {
+        char num[16];
+        const char* line = shell_history_get(i);
+
+        if (!line) {
+            continue;
+        }
+        if (pattern && pattern[0] && !str_contains(line, pattern)) {
+            continue;
+        }
+
+        u32_to_dec(i + 1u, num, sizeof(num));
+        if (append_text(out, sizeof(out), &pos, num) != 0 ||
+            append_text(out, sizeof(out), &pos, " ") != 0 ||
+            append_text(out, sizeof(out), &pos, line) != 0 ||
+            append_text(out, sizeof(out), &pos, "\n") != 0) {
+            break;
+        }
+        shown++;
+    }
+
+    if (shown == 0u) {
+        (void)append_text(out, sizeof(out), &pos, "(empty)\n");
+    }
+
+    return shell_output_blob(cmd, (const uint8_t*)out, (uint32_t)pos);
+}
+
+static uint8_t shell_has_token_separator(const char* text, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        if (text[i] == ' ' || text[i] == '\t' || text[i] == ';' || text[i] == '|' || text[i] == '&') {
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+static int shell_complete_collect(
+    const char* prefix,
+    char matches[][MYAOS_NAME_MAX],
+    size_t max_matches,
+    size_t* out_count
+) {
+    myaos_dirent_t entries[SHELL_HELP_LIST_MAX];
+    char seen[SHELL_HELP_SEEN_MAX][MYAOS_NAME_MAX];
+    size_t seen_count = 0;
+    size_t match_count = 0;
+    size_t count = 0;
+    const char* manifest_dir = "/cmd";
+    const char* elf_dirs[] = {"/bin", "/boot/bin"};
+    const size_t elf_dir_count = sizeof(elf_dirs) / sizeof(elf_dirs[0]);
+
+    if (!prefix || !matches || !out_count) {
+        return -1;
+    }
+    *out_count = 0u;
+
+    if (vfs_list(scheduler_current_cwd(), manifest_dir, entries, SHELL_HELP_LIST_MAX, &count) != 0 || count == 0u) {
+        manifest_dir = "/boot/cmd";
+    }
+    if (vfs_list(scheduler_current_cwd(), manifest_dir, entries, SHELL_HELP_LIST_MAX, &count) == 0) {
+        for (size_t i = 0; i < count; i++) {
+            char name[MYAOS_NAME_MAX];
+
+            if (entries[i].type != MYAOS_NODE_FILE) {
+                continue;
+            }
+            if (extract_command_name(entries[i].name, ".cmd", name, sizeof(name)) != 0) {
+                continue;
+            }
+            if (!str_starts_with_ci(name, prefix)) {
+                continue;
+            }
+            if (shell_help_name_seen(seen, seen_count, name)) {
+                continue;
+            }
+            shell_help_mark_name(seen, &seen_count, name);
+            if (match_count < max_matches) {
+                str_copy(matches[match_count], name, MYAOS_NAME_MAX);
+                match_count++;
+            }
+        }
+    }
+
+    for (size_t d = 0; d < elf_dir_count; d++) {
+        const char* elf_dir = elf_dirs[d];
+
+        if (vfs_list(scheduler_current_cwd(), elf_dir, entries, SHELL_HELP_LIST_MAX, &count) != 0) {
+            continue;
+        }
+        for (size_t i = 0; i < count; i++) {
+            char name[MYAOS_NAME_MAX];
+
+            if (entries[i].type != MYAOS_NODE_FILE) {
+                continue;
+            }
+            if (extract_command_name(entries[i].name, ".elf", name, sizeof(name)) != 0) {
+                continue;
+            }
+            if (!str_starts_with_ci(name, prefix)) {
+                continue;
+            }
+            if (shell_help_name_seen(seen, seen_count, name)) {
+                continue;
+            }
+            shell_help_mark_name(seen, &seen_count, name);
+            if (match_count < max_matches) {
+                str_copy(matches[match_count], name, MYAOS_NAME_MAX);
+                match_count++;
+            }
+        }
+    }
+
+    *out_count = match_count;
+    return 0;
+}
+
+static void shell_try_complete_command(void) {
+    char prefix[MYAOS_NAME_MAX];
+    char matches[32][MYAOS_NAME_MAX];
+    size_t match_count = 0;
+
+    if (g_input_cursor != g_input_len || g_input_len == 0u) {
+        return;
+    }
+    if (g_input_len >= sizeof(prefix)) {
+        return;
+    }
+    if (shell_has_token_separator(g_input, g_input_len)) {
+        return;
+    }
+
+    str_copy(prefix, g_input, sizeof(prefix));
+    if (shell_complete_collect(prefix, matches, 32u, &match_count) != 0 || match_count == 0u) {
+        return;
+    }
+
+    if (match_count == 1u) {
+        str_copy(g_input, matches[0], sizeof(g_input));
+        g_input_len = (uint32_t)str_len(g_input);
+        g_input_cursor = g_input_len;
+        shell_cursor_activity();
+        shell_render_input(1u);
+        return;
+    }
+
+    shell_restore_cursor_overlay();
+    console_put_char('\n');
+    for (size_t i = 0; i < match_count; i++) {
+        console_write(matches[i]);
+        console_put_char('\n');
+    }
+    g_prompt_shown = 0u;
+}
+
+static int shell_cd(int argc, char* const* argv) {
     char abs_path[MYAOS_PATH_MAX];
+    int is_dir_rc;
 
     if (argc < 2) {
         console_write(scheduler_current_cwd());
         console_put_char('\n');
-        return;
+        return 0;
     }
     if (vfs_resolve_cwd(scheduler_current_cwd(), argv[1], abs_path, sizeof(abs_path)) != 0) {
-        console_write("invalid path\n");
-        return;
+        console_write("error: ");
+        console_write(argv[1]);
+        console_write(": invalid path\n");
+        console_write("hint: use an absolute path like /dir or a valid relative path\n");
+        return 1;
     }
-    if (vfs_is_dir("/", abs_path) <= 0 || scheduler_setcwd_current(abs_path) != 0) {
-        console_write("directory not found\n");
+    is_dir_rc = vfs_is_dir("/", abs_path);
+    if (is_dir_rc <= 0 || scheduler_setcwd_current(abs_path) != 0) {
+        console_write("error: ");
+        console_write(abs_path);
+        if (is_dir_rc == 0) {
+            console_write(": not a directory\n");
+        } else {
+            console_write(": directory not found or access denied\n");
+        }
+        console_write("hint: verify the path with `ls` and directory permissions\n");
+        return 1;
     }
+    return 0;
 }
 
-static void shell_execute(const char* raw_line);
+static int32_t shell_execute(const char* raw_line);
 
 static void shell_debug_write(const char* text) {
     if (!g_debug_mode) {
@@ -876,7 +1432,9 @@ static int shell_run_script(
                     console_write(line);
                     console_put_char('\n');
                 }
-                shell_execute(line);
+                if (shell_execute(line) != 0) {
+                    console_write("warning: script command returned non-zero status\n");
+                }
             }
             while (line_start <= i) {
                 line_start++;
@@ -944,6 +1502,40 @@ static int shell_debug_builtin(int argc, char* const* argv) {
     return 1;
 }
 
+static int shell_verbose_builtin(int argc, char* const* argv) {
+    char mode[16];
+
+    if (argc < 2) {
+        console_write("verbose is ");
+        console_write(g_verbose_mode ? "on" : "off");
+        console_put_char('\n');
+        return 0;
+    }
+
+    str_copy(mode, argv[1], sizeof(mode));
+    to_lower(mode);
+
+    if (str_eq(mode, "on")) {
+        g_verbose_mode = 1u;
+        console_write("verbose on\n");
+        return 0;
+    }
+    if (str_eq(mode, "off")) {
+        g_verbose_mode = 0u;
+        console_write("verbose off\n");
+        return 0;
+    }
+    if (str_eq(mode, "toggle")) {
+        g_verbose_mode = g_verbose_mode ? 0u : 1u;
+        console_write("verbose ");
+        console_write(g_verbose_mode ? "on\n" : "off\n");
+        return 0;
+    }
+
+    console_write("usage: verbose [on|off|toggle]\n");
+    return 1;
+}
+
 static int parse_command_tokens(char** tokens, int start, int end, shell_cmd_t* out) {
     int argc = 0;
 
@@ -997,6 +1589,106 @@ static int shell_is_script_invocation(const char* cmd0) {
            str_contains_char(cmd0, '/');
 }
 
+static void shell_write_error_with_hint(const char* object, const char* reason, const char* hint) {
+    console_write("error: ");
+    if (object && object[0]) {
+        console_write(object);
+        console_write(": ");
+    }
+    console_write(reason ? reason : "operation failed");
+    console_put_char('\n');
+    if (hint && hint[0]) {
+        console_write("hint: ");
+        console_write(hint);
+        console_put_char('\n');
+    }
+}
+
+static int shell_build_boot_exec_path(const char* exec_path, char* out, size_t out_size) {
+    size_t base = 0u;
+    const char* suffix;
+
+    if (!exec_path || !out || out_size == 0u || !str_starts_with(exec_path, "/bin/")) {
+        return -1;
+    }
+
+    str_copy(out, "/boot/bin/", out_size);
+    base = str_len(out);
+    suffix = exec_path + 5;
+    for (size_t i = 0; suffix[i] && base + 1u < out_size; i++) {
+        out[base++] = suffix[i];
+    }
+    out[base] = '\0';
+    return 0;
+}
+
+static shell_exec_probe_t shell_probe_exec_path(const char* exec_path, char* out_abs_path, size_t out_abs_size) {
+    uint8_t probe = 0u;
+    uint32_t read_size = 0u;
+
+    if (!exec_path || !exec_path[0] || !out_abs_path || out_abs_size == 0u) {
+        return SHELL_EXEC_PROBE_INVALID_PATH;
+    }
+    if (vfs_resolve_cwd(scheduler_current_cwd(), exec_path, out_abs_path, out_abs_size) != 0) {
+        return SHELL_EXEC_PROBE_INVALID_PATH;
+    }
+    if (vfs_is_dir("/", out_abs_path) > 0) {
+        return SHELL_EXEC_PROBE_IS_DIR;
+    }
+    if (vfs_can_exec("/", out_abs_path) != 0) {
+        return SHELL_EXEC_PROBE_NO_EXEC;
+    }
+    if (vfs_read_file("/", out_abs_path, &probe, sizeof(probe), &read_size) != 0) {
+        return SHELL_EXEC_PROBE_NOT_FOUND;
+    }
+    return SHELL_EXEC_PROBE_OK;
+}
+
+static void shell_report_spawn_failure(const char* exec_path, uint8_t tried_boot_fallback) {
+    char abs_exec_path[MYAOS_PATH_MAX];
+    shell_exec_probe_t probe = shell_probe_exec_path(exec_path, abs_exec_path, sizeof(abs_exec_path));
+
+    if (probe == SHELL_EXEC_PROBE_INVALID_PATH) {
+        shell_write_error_with_hint(exec_path, "invalid executable path", "use load /boot/bin/<name>.elf or an absolute path");
+        return;
+    }
+    if (probe == SHELL_EXEC_PROBE_IS_DIR) {
+        shell_write_error_with_hint(abs_exec_path, "path points to a directory", "choose an ELF program file (for example /boot/bin/name.elf)");
+        return;
+    }
+    if (probe == SHELL_EXEC_PROBE_NO_EXEC) {
+        shell_write_error_with_hint(abs_exec_path, "execute permission denied", "run chmod 755 <file> or use an executable from /boot/bin");
+        return;
+    }
+    if (probe == SHELL_EXEC_PROBE_NOT_FOUND) {
+        if (tried_boot_fallback && str_starts_with(exec_path, "/bin/")) {
+            char boot_exec_path[MYAOS_PATH_MAX];
+            char abs_boot_exec_path[MYAOS_PATH_MAX];
+            shell_exec_probe_t boot_probe = SHELL_EXEC_PROBE_NOT_FOUND;
+
+            if (shell_build_boot_exec_path(exec_path, boot_exec_path, sizeof(boot_exec_path)) == 0) {
+                boot_probe = shell_probe_exec_path(boot_exec_path, abs_boot_exec_path, sizeof(abs_boot_exec_path));
+            }
+            if (boot_probe == SHELL_EXEC_PROBE_NOT_FOUND) {
+                shell_write_error_with_hint(
+                    exec_path,
+                    "program not found in /bin or /boot/bin",
+                    "check package installation and run help to list available commands"
+                );
+                return;
+            }
+        }
+        shell_write_error_with_hint(abs_exec_path, "file not found or read denied", "check path spelling and read permissions");
+        return;
+    }
+
+    shell_write_error_with_hint(
+        abs_exec_path,
+        "loader rejected executable (invalid ELF/ABI or corrupted file)",
+        "rebuild the program and compare ABI via the `abi` command"
+    );
+}
+
 static int shell_spawn_exec_path(
     const shell_cmd_t* cmd,
     const char* exec_path,
@@ -1009,8 +1701,11 @@ static int shell_spawn_exec_path(
     const char* spawn_exec_path = exec_path;
     int32_t pid = -1;
     int32_t exit_code = 0;
+    int64_t spawn_rc;
     uint8_t ctrl_c_sent = 0;
     uint8_t ctrl_c_passthrough = 0;
+    uint8_t tried_boot_fallback = 0u;
+    uint8_t used_boot_fallback = 0u;
 
     if (!cmd || !exec_path || !argv || argc <= 0) {
         return 126;
@@ -1042,43 +1737,45 @@ static int shell_spawn_exec_path(
         str_copy(opts.stdout_path, cmd->out_path, sizeof(opts.stdout_path));
     }
 
-    if (syscall_invoke(
-            MYAOS_SYS_PROC_SPAWN_EX,
-            (uint64_t)(uintptr_t)spawn_exec_path,
-            (uint64_t)(uint32_t)argc,
-            (uint64_t)(uintptr_t)argv,
-            (uint64_t)(uintptr_t)&opts,
-            (uint64_t)(uintptr_t)&pid
-        ) != 0) {
+    spawn_rc = syscall_invoke(
+        MYAOS_SYS_PROC_SPAWN_EX,
+        (uint64_t)(uintptr_t)spawn_exec_path,
+        (uint64_t)(uint32_t)argc,
+        (uint64_t)(uintptr_t)argv,
+        (uint64_t)(uintptr_t)&opts,
+        (uint64_t)(uintptr_t)&pid
+    );
+    if (spawn_rc != 0) {
         if (str_starts_with(exec_path, "/bin/")) {
-            str_copy(boot_exec_path, "/boot/bin/", sizeof(boot_exec_path));
-            {
-                size_t base = str_len(boot_exec_path);
-                const char* suffix = exec_path + 5;
-                for (size_t i = 0; suffix[i] && base + 1 < sizeof(boot_exec_path); i++) {
-                    boot_exec_path[base++] = suffix[i];
+            tried_boot_fallback = 1u;
+            if (shell_build_boot_exec_path(exec_path, boot_exec_path, sizeof(boot_exec_path)) == 0) {
+                spawn_exec_path = boot_exec_path;
+                if (str_eq(spawn_exec_path, "/boot/bin/msh.elf")) {
+                    ctrl_c_passthrough = 1u;
                 }
-                boot_exec_path[base] = '\0';
-            }
-            spawn_exec_path = boot_exec_path;
-            if (str_eq(spawn_exec_path, "/boot/bin/msh.elf")) {
-                ctrl_c_passthrough = 1u;
-            }
-            if (syscall_invoke(
+                spawn_rc = syscall_invoke(
                     MYAOS_SYS_PROC_SPAWN_EX,
                     (uint64_t)(uintptr_t)spawn_exec_path,
                     (uint64_t)(uint32_t)argc,
                     (uint64_t)(uintptr_t)argv,
                     (uint64_t)(uintptr_t)&opts,
                     (uint64_t)(uintptr_t)&pid
-                ) != 0) {
-                console_write("failed to start program\n");
-                return 126;
+                );
+                if (spawn_rc == 0) {
+                    used_boot_fallback = 1u;
+                }
             }
-        } else {
-            console_write("failed to start program\n");
+        }
+        if (spawn_rc != 0) {
+            shell_report_spawn_failure(exec_path, tried_boot_fallback);
             return 126;
         }
+    }
+
+    if (used_boot_fallback) {
+        console_write("note: using fallback executable ");
+        console_write(spawn_exec_path);
+        console_put_char('\n');
     }
 
     if (cmd->background) {
@@ -1099,7 +1796,10 @@ static int shell_spawn_exec_path(
         );
 
         if (wait_state < 0) {
-            console_write("wait failed\n");
+            console_write("error: pid ");
+            console_write_u32((uint32_t)pid);
+            console_write(": wait failed\n");
+            console_write("hint: process may already be reaped or not owned by this shell\n");
             return 125;
         }
         if (wait_state > 0) {
@@ -1145,13 +1845,15 @@ static int shell_spawn_command(const shell_cmd_t* cmd, int32_t* out_exit_code) {
     if (str_eq(cmd_name, "help")) {
         return shell_help(cmd);
     }
+    if (str_eq(cmd_name, "history")) {
+        return shell_history_builtin(cmd);
+    }
     if (str_eq(cmd_name, "cd")) {
         if (cmd->out_path[0]) {
             console_write("redirection for builtins is not supported\n");
             return 1;
         }
-        shell_cd(cmd->argc, cmd->argv);
-        return 0;
+        return shell_cd(cmd->argc, cmd->argv);
     }
     if (str_eq(cmd_name, "debug")) {
         if (cmd->out_path[0]) {
@@ -1159,6 +1861,13 @@ static int shell_spawn_command(const shell_cmd_t* cmd, int32_t* out_exit_code) {
             return 1;
         }
         return shell_debug_builtin(cmd->argc, cmd->argv);
+    }
+    if (str_eq(cmd_name, "verbose")) {
+        if (cmd->out_path[0]) {
+            console_write("redirection for builtins is not supported\n");
+            return 1;
+        }
+        return shell_verbose_builtin(cmd->argc, cmd->argv);
     }
     if (str_eq(cmd_name, "autorun")) {
         if (cmd->out_path[0]) {
@@ -1204,7 +1913,10 @@ static int shell_spawn_command(const shell_cmd_t* cmd, int32_t* out_exit_code) {
     }
 
     if (read_command_manifest(cmd_name, exec_path, sizeof(exec_path), desc, sizeof(desc)) != 0) {
-        console_write("unknown command\n");
+        console_write("error: command not found: ");
+        console_write(cmd->argv[0]);
+        console_put_char('\n');
+        console_write("hint: run help to list commands from /cmd and /bin\n");
         return 127;
     }
     return shell_spawn_exec_path(cmd, exec_path, cmd->argc, cmd->argv, out_exit_code);
@@ -1355,7 +2067,7 @@ static int shell_execute_segment(char** tokens, int start, int end, int32_t* out
     return status;
 }
 
-static void shell_execute(const char* raw_line) {
+static int32_t shell_execute(const char* raw_line) {
     char line[SHELL_INPUT_MAX];
     char* tokens[SHELL_TOK_MAX];
     int tok_count;
@@ -1366,7 +2078,7 @@ static void shell_execute(const char* raw_line) {
     str_copy(line, raw_line, sizeof(line));
     trim_in_place(line);
     if (!line[0]) {
-        return;
+        return 0;
     }
     if (g_debug_mode) {
         console_write("[debug] line: ");
@@ -1379,7 +2091,7 @@ static void shell_execute(const char* raw_line) {
         if (tok_count < 0) {
             console_write("parse error\n");
         }
-        return;
+        return 2;
     }
     shell_debug_tokens(tokens, tok_count);
 
@@ -1405,6 +2117,9 @@ static void shell_execute(const char* raw_line) {
             last_status = 0;
             if (shell_execute_segment(tokens, seg_start, seg_end, &last_status) < 0) {
                 console_write("execution error\n");
+                if (last_status == 0) {
+                    last_status = 1;
+                }
                 break;
             }
         } else if (g_debug_mode) {
@@ -1423,6 +2138,8 @@ static void shell_execute(const char* raw_line) {
         }
         idx = seg_end + 1;
     }
+
+    return last_status;
 }
 
 static void shell_erase_rendered_input(void) {
@@ -1458,7 +2175,7 @@ static void shell_draw_cursor_overlay(void) {
         return;
     }
 
-    absolute_col = g_prompt_col + g_input_cursor;
+    absolute_col = g_prompt_col + shell_utf8_cell_count(g_input, g_input_cursor);
     col = absolute_col % cols;
     row = g_prompt_row + (absolute_col / cols);
     x = col * FONT_WIDTH;
@@ -1484,7 +2201,7 @@ static void shell_render_input(uint8_t show_cursor) {
 
     if (g_input_len > 0u) {
         console_write_len(g_input, g_input_len);
-        g_rendered_input_len = g_input_len;
+        g_rendered_input_len = shell_utf8_cell_count(g_input, g_input_len);
     } else {
         g_rendered_input_len = 0u;
     }
@@ -1507,16 +2224,61 @@ static void shell_clear_input_line(void) {
     g_input[0] = '\0';
 }
 
-static void shell_restore_last_command(void) {
-    if (!g_has_last_command) {
-        return;
-    }
+static void shell_set_input_text(const char* text) {
     shell_clear_input_line();
-    str_copy(g_input, g_last_command, sizeof(g_input));
+    str_copy(g_input, text ? text : "", sizeof(g_input));
     g_input_len = (uint32_t)str_len(g_input);
     g_input_cursor = g_input_len;
     shell_cursor_activity();
     shell_render_input(1u);
+}
+
+static void shell_restore_last_command(void) {
+    const char* line;
+
+    if (g_history_count == 0u) {
+        return;
+    }
+    if (g_history_nav < 0) {
+        str_copy(g_history_saved_input, g_input, sizeof(g_history_saved_input));
+        g_history_saved_valid = 1u;
+        g_history_nav = (int32_t)(g_history_count - 1u);
+    } else if (g_history_nav > 0) {
+        g_history_nav--;
+    }
+
+    line = shell_history_get((uint32_t)g_history_nav);
+    if (line) {
+        shell_set_input_text(line);
+    }
+}
+
+static void shell_history_nav_down(void) {
+    const char* line;
+
+    if (g_history_nav < 0) {
+        shell_clear_input_line();
+        shell_render_input(1u);
+        return;
+    }
+
+    if ((uint32_t)(g_history_nav + 1) < g_history_count) {
+        g_history_nav++;
+        line = shell_history_get((uint32_t)g_history_nav);
+        if (line) {
+            shell_set_input_text(line);
+        }
+        return;
+    }
+
+    g_history_nav = -1;
+    if (g_history_saved_valid) {
+        shell_set_input_text(g_history_saved_input);
+    } else {
+        shell_clear_input_line();
+        shell_render_input(1u);
+    }
+    g_history_saved_valid = 0u;
 }
 
 void shell_init(void) {
@@ -1525,10 +2287,16 @@ void shell_init(void) {
     g_input[0] = '\0';
     g_last_command[0] = '\0';
     g_has_last_command = 0;
+    g_history_start = 0u;
+    g_history_count = 0u;
+    g_history_nav = -1;
+    g_history_saved_input[0] = '\0';
+    g_history_saved_valid = 0u;
     g_prompt_shown = 0;
     g_pipe_seq = 1u;
     g_debug_mode = 0;
     g_autorun_done = 0;
+    g_recovery_mode = 0u;
     g_rendered_input_len = 0u;
     g_cursor_visible = 1u;
     g_cursor_last_blink_tick = 0u;
@@ -1538,6 +2306,12 @@ void shell_init(void) {
     g_cursor_overlay_col = 0u;
     g_cursor_overlay_row = 0u;
     g_cursor_overlay_index = 0u;
+    g_last_status = 0;
+    g_verbose_mode = 0u;
+    for (size_t i = 0; i < SHELL_HISTORY_MAX; i++) {
+        g_history[i][0] = '\0';
+    }
+    shell_history_load_persistent();
     for (size_t i = 0; i < SHELL_MANIFEST_CACHE_MAX; i++) {
         g_manifest_cache[i].used = 0u;
         g_manifest_cache[i].name[0] = '\0';
@@ -1546,13 +2320,20 @@ void shell_init(void) {
     }
 }
 
+void shell_set_recovery_mode(uint8_t enabled) {
+    g_recovery_mode = enabled ? 1u : 0u;
+}
+
 int shell_main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
-    console_write("myaos shell\n");
+    console_write(g_recovery_mode ? "myaos recovery shell\n" : "myaos shell\n");
     console_write("type help\n\n");
-    if (!g_autorun_done) {
+    if (g_recovery_mode) {
+        console_write("recovery mode: autorun disabled\n");
+        console_write("tip: log --file /var/log/boot.last.log\n\n");
+    } else if (!g_autorun_done) {
         g_autorun_done = 1;
         (void)shell_run_autorun_default();
     }
@@ -1562,6 +2343,12 @@ int shell_main(int argc, char** argv) {
         uint64_t now;
 
         if (!g_prompt_shown) {
+            console_set_mode(CONSOLE_MODE_TEXT);
+            char code[16];
+            i32_to_dec(g_last_status, code, sizeof(code));
+            console_write("[");
+            console_write(code);
+            console_write("] ");
             console_write(scheduler_current_cwd());
             console_write(" $ ");
             console_get_cursor(&g_prompt_col, &g_prompt_row);
@@ -1582,6 +2369,8 @@ int shell_main(int argc, char** argv) {
 
         if (keyboard_take_ctrl_c()) {
             shell_clear_input_line();
+            g_history_nav = -1;
+            g_history_saved_valid = 0u;
             console_write("^C\n");
             g_prompt_shown = 0;
             continue;
@@ -1599,27 +2388,31 @@ int shell_main(int argc, char** argv) {
             continue;
         }
         if (c == KEYBOARD_KEY_DOWN) {
-            shell_clear_input_line();
-            shell_render_input(1u);
+            shell_history_nav_down();
             continue;
         }
         if (c == KEYBOARD_KEY_LEFT) {
             if (g_input_cursor > 0u) {
-                g_input_cursor--;
+                g_input_cursor = shell_utf8_prev_start(g_input, g_input_cursor);
             }
             shell_render_input(1u);
             continue;
         }
         if (c == KEYBOARD_KEY_RIGHT) {
             if (g_input_cursor < g_input_len) {
-                g_input_cursor++;
+                g_input_cursor = shell_utf8_next_start(g_input, g_input_len, g_input_cursor);
             }
             shell_render_input(1u);
+            continue;
+        }
+        if (c == '\t') {
+            shell_try_complete_command();
             continue;
         }
 
         if (c == '\n') {
             char committed[SHELL_INPUT_MAX];
+            int32_t status;
 
             shell_render_input(0u);
             console_put_char('\n');
@@ -1629,11 +2422,22 @@ int shell_main(int argc, char** argv) {
             if (committed[0]) {
                 str_copy(g_last_command, committed, sizeof(g_last_command));
                 g_has_last_command = 1u;
+                shell_history_commit(committed);
             }
-            shell_execute(g_input);
+            status = shell_execute(g_input);
+            g_last_status = status;
+            if (g_verbose_mode && status != 0) {
+                char code[16];
+                i32_to_dec(status, code, sizeof(code));
+                console_write("exit-code: ");
+                console_write(code);
+                console_put_char('\n');
+            }
             g_input_len = 0u;
             g_input_cursor = 0u;
             g_input[0] = '\0';
+            g_history_nav = -1;
+            g_history_saved_valid = 0u;
             g_rendered_input_len = 0u;
             g_cursor_visible = 1u;
             g_prompt_shown = 0;
@@ -1641,23 +2445,32 @@ int shell_main(int argc, char** argv) {
         }
 
         if (c == '\b') {
+            if (g_history_nav >= 0) {
+                g_history_nav = -1;
+                g_history_saved_valid = 0u;
+            }
             if (g_input_cursor > 0u && g_input_len > 0u) {
-                uint32_t start = g_input_cursor - 1u;
-                for (uint32_t i = start; i + 1u < g_input_len; i++) {
-                    g_input[i] = g_input[i + 1u];
+                uint32_t start = shell_utf8_prev_start(g_input, g_input_cursor);
+                uint32_t removed = g_input_cursor - start;
+                for (uint32_t i = start; i + removed < g_input_len; i++) {
+                    g_input[i] = g_input[i + removed];
                 }
-                g_input_len--;
-                g_input_cursor--;
+                g_input_len -= removed;
+                g_input_cursor = start;
                 g_input[g_input_len] = '\0';
             }
             shell_render_input(1u);
             continue;
         }
 
-        if (c < 32 || c > 126 || g_input_len + 1 >= sizeof(g_input)) {
+        if ((uint8_t)c < 32u || (uint8_t)c == 127u || g_input_len + 1 >= sizeof(g_input)) {
             continue;
         }
 
+        if (g_history_nav >= 0) {
+            g_history_nav = -1;
+            g_history_saved_valid = 0u;
+        }
         for (uint32_t i = g_input_len; i > g_input_cursor; i--) {
             g_input[i] = g_input[i - 1u];
         }

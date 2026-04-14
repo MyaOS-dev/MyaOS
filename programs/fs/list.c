@@ -1,11 +1,13 @@
 #include "../lib/myaos.h"
 
+#define LIST_MAX 256u
+
 int program_main(int argc, char** argv) {
-    myaos_dirent_t entries[64];
+    static myaos_dirent_t entries[LIST_MAX];
     uint32_t count = 0;
     const char* path = (argc > 1) ? argv[1] : ".";
 
-    if (mya_fs_list(path, entries, 64, &count) != 0) {
+    if (mya_fs_list(path, entries, LIST_MAX, &count) != 0) {
         mya_putln("ls failed");
         return 1;
     }
